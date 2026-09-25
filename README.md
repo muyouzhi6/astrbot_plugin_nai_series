@@ -95,9 +95,9 @@ Images 请求不自动传 seed, 避免部分中转把字符串随机种子改成
 
 2026-09-25 在两条上述兼容连接分别实测 NAI 4.5 和 NAI 5. 四张图片的 PNG Source 分别为 NovelAI Diffusion V4.5 / V5, 尺寸均为 832x1216, 步数分别为 23 / 28, prompt 与负面词符合请求.
 
-官方适配器实现原始模型名传递、`/ai/generate-image`、200/201、ZIP/JSON/SSE 最终图片解析. 已用模拟协议测试, 尚未使用官方账号密钥完成真实出图. 官方公开 OpenAPI 的模型枚举较旧, 不据此把新版模型映射成旧版.
+官方适配器实现原始模型名传递、`/ai/generate-image`、200/201、ZIP/JSON/SSE 最终图片解析. JSON 支持官方 `images[].image` 对象结构. 请求字段按图片站点的 `https://image.novelai.net/docs/doc.json` 核对. 已用模拟协议测试, 尚未使用官方账号密钥完成真实出图, 不将新版模型映射成旧版.
 
-平台收图仍以用户实际会话结果为准, API 出图测试不等于 QQ 端到端测试.
+已用部署代码执行 nai4/nai5 命令处理器, 经 AstrBot 真实图片序列化及 OneBot WebSocket 向维护者 QQ 私聊发送两张新图与图册, 三条图片消息均取得 message_id 并通过 get_msg 回读. 此为受控处理器与实际发送链路验证, 不等同于覆盖所有群消息、其他插件拦截及所有平台.
 
 ## 开发与测试
 

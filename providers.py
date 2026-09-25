@@ -250,7 +250,14 @@ class OfficialNovelAIProvider:
         if isinstance(encoded, str) and encoded:
             return [self._decode_image(encoded)]
         if isinstance(data, dict) and isinstance(data.get("images"), list):
-            return [self._decode_image(item) for item in data["images"] if isinstance(item, str)]
+            images = []
+            for item in data["images"]:
+                encoded = item.get("image") if isinstance(item, dict) else item
+                if not isinstance(encoded, str) or not encoded:
+                    raise GenerationError("图片 JSON 中存在无效条目")
+                images.append(self._decode_image(encoded))
+            if images:
+                return images
         raise GenerationError(f"{self.name} JSON 响应没有图片")
 
     def _parse_sse_images(self, body: bytes) -> list[GeneratedImage]:
@@ -267,9 +274,15 @@ class OfficialNovelAIProvider:
             except json.JSONDecodeError:
                 continue
             encoded = data.get("image") if isinstance(data, dict) else None
-            if data.get("error"):
+            if not isinstance(data, dict):
+                raise GenerationError("图片流事件格式错误")
+            if data.get("error") or data.get("event_type") == "error":
                 raise GenerationError("图片流返回上游错误")
-            if isinstance(encoded, str) and encoded and data.get("final") is True:
+            if (
+                isinstance(encoded, str)
+                and encoded
+                and (data.get("final") is True or data.get("event_type") == "final")
+            ):
                 images = [self._decode_image(encoded)]
         if not images:
             raise GenerationError(f"{self.name} SSE 响应没有图片")

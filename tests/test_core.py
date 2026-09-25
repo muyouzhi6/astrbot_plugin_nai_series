@@ -28,6 +28,8 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     def test_official_json_and_final_sse(self):
         provider = OfficialNovelAIProvider("native", "https://image.novelai.net", "test")
         encoded = base64.b64encode(PNG).decode()
+        native = json.dumps({"images": [{"image": encoded, "index": 0, "seed": 12}]}).encode()
+        self.assertEqual(provider._parse_json_image(native)[0].data, PNG)
         self.assertEqual(
             provider._parse_json_image(json.dumps({"image": encoded}).encode())[0].data, PNG
         )
