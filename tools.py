@@ -21,7 +21,7 @@ def make_tools(plugin):
             name=f"{family}_generate_image",
             family=family,
             plugin=plugin,
-            description=f"当用户明确要求用 {family} 生图时调用. 每次生成一张并发送到当前会话. 保留用户原意, 不编造画师串或预设. 不确定预设时留空. 工具返回成功前不能声称图片已发送. nai4 指 4.5, nai5 指 5, 不得互换. 成本和权限与指令一致.",
+            description=f"当用户明确要求用 {family} 生图时直接调用. 每次提交一张后台图片, 完成后自动发送, 用户可继续聊天. 调用前后不要输出提示、进度或完成说明. 保留用户原意, 不编造画师串或预设. 不确定预设时留空. 同一请求只提交一次, 无需轮询. nai4 指 4.5, nai5 指 5, 不得互换.",
             parameters={
                 "type": "object",
                 "properties": {

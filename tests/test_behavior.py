@@ -7,9 +7,11 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from astrbot_plugin_nai_series.background import BackgroundQueue
 from astrbot_plugin_nai_series.commands import generation_args
 from astrbot_plugin_nai_series.gallery import render_gallery, save_preview
 from astrbot_plugin_nai_series.models import GenerationRequest, find_preset, parse_presets
@@ -117,6 +119,20 @@ class Event:
     def __init__(self, user="1"):
         self.user = user
         self.messages = []
+        self.extra = {}
+        self.result = None
+
+    def set_extra(self, key, value):
+        self.extra[key] = value
+
+    def get_extra(self, key, default=None):
+        return self.extra.get(key, default)
+
+    def get_result(self):
+        return self.result
+
+    def clear_result(self):
+        self.result = None
 
     def get_sender_id(self):
         return self.user
@@ -162,27 +178,39 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "steps_nai5": 28,
         }
         self.plugin.store = Store(Path(self.directory.name))
-        self.plugin.semaphore = asyncio.Semaphore(2)
-        self.plugin.pending = 0
-        self.plugin.user_tasks = {}
-        self.plugin.cooldowns = {}
+        self.plugin.queue = BackgroundQueue(
+            self.plugin.store, self.plugin.config, self.plugin._process_job
+        )
+        self.plugin.context = SimpleNamespace(send_message=AsyncMock(return_value=True))
         self.plugin.translator = PromptTranslator(self.plugin.config)
         self.plugin.router = AsyncMock()
         self.plugin.router.generate.return_value = ([GeneratedImage(png())], "test")
 
     async def asyncTearDown(self):
+        await self.plugin.queue.close()
         self.directory.cleanup()
+
+    async def finish(self):
+        tasks = list(self.plugin.queue.tasks.values())
+        if tasks:
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+
+    async def execute(self, event, model, prompt, **kwargs):
+        task_id = self.plugin._submit(event, model, prompt, **kwargs)
+        await self.finish()
+        return self.plugin.store.job(task_id, self.plugin._key(event))
 
     async def test_nai4_and_nai5_commands_do_not_cross_profiles(self):
         event = Event()
         for family, handler in [("nai4", self.plugin.cmd_nai4), ("nai5", self.plugin.cmd_nai5)]:
             results = [item async for item in handler(event, "cat")]
-            self.assertEqual(results, [])
+            self.assertIn("已提交", results[0])
+            await self.finish()
             request = self.plugin.router.generate.call_args.args[0]
             self.assertEqual(request.model, self.plugin._model(family))
             self.assertEqual(request.prompt, f"style{family[-1]}, cat")
             self.assertEqual(request.negative_prompt, f"bad{family[-1]}")
-            self.assertTrue(any(isinstance(item, list) for item in event.messages))
+        self.assertEqual(self.plugin.context.send_message.await_count, 2)
 
     def test_command_filter_greedy_argument_excludes_command_name(self):
         params = CommandFilter("nai5").validate_and_convert_params(
@@ -210,22 +238,18 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_delivery_never_reports_success(self):
         event = Event()
 
-        async def fail(value):
-            if isinstance(value, list):
-                raise RuntimeError("send failed")
-
-        event.send = fail
-        with self.assertRaises(RuntimeError):
-            await self.plugin._execute(event, self.plugin._model("nai5"), "cat")
+        self.plugin.context.send_message.side_effect = RuntimeError("send failed")
+        job = await self.execute(event, self.plugin._model("nai5"), "cat")
+        self.assertEqual(job["state"], "send_unknown")
         self.assertEqual(self.plugin.pending, 0)
-        self.assertFalse(self.plugin.user_tasks)
+        self.assertFalse(self.plugin.queue.tasks)
 
     async def test_reroll_preserves_actual_prompt_after_config_change(self):
         event = Event()
-        await self.plugin._execute(event, self.plugin._model("nai5"), "cat")
+        await self.execute(event, self.plugin._model("nai5"), "cat")
         snapshot = self.plugin._state(event).last_request
         self.plugin.config["presets"][1]["artist_prompt"] = "changed"
-        await self.plugin._execute(event, snapshot["model"], "", snapshot=snapshot)
+        await self.execute(event, snapshot["model"], "", snapshot=snapshot)
         self.assertEqual(asdict(self.plugin.router.generate.call_args.args[0]), snapshot)
 
     def test_curated_keeps_family_preset_without_overriding_model(self):
@@ -237,7 +261,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_tool_does_not_generate(self):
         text = await self.plugin.generate_as_tool(Event(), "nai5", {"prompt": "cat"})
-        self.assertIn("未开启", text)
+        self.assertIsNone(text)
         self.plugin.router.generate.assert_not_awaited()
 
     async def test_enabled_tool_dispatches_correct_model(self):
@@ -248,7 +272,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t.name for t in tools], ["nai4_generate_image", "nai5_generate_image"])
         context = SimpleNamespace(context=SimpleNamespace(event=Event()))
         result = await tools[1].call(context, prompt="cat", preset="B")
-        self.assertIn("图片已发送", result)
+        self.assertIsNone(result)
+        await self.finish()
         self.assertEqual(
             self.plugin.router.generate.call_args.args[0].model, "nai-diffusion-5-full"
         )
@@ -282,20 +307,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.router.generate.side_effect = pending
         event = Event()
-        task = asyncio.create_task(self.plugin._execute(event, "nai-diffusion-5-full", "cat"))
+        self.plugin._submit(event, "nai-diffusion-5-full", "cat")
+        self.plugin._submit(event, "nai-diffusion-4-5-full", "another cat")
         await asyncio.sleep(0)
-        with self.assertRaisesRegex(ValueError, "已有"):
-            await self.plugin._execute(event, "nai-diffusion-5-full", "another cat")
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+        self.assertEqual(self.plugin.router.generate.await_count, 2)
+        with self.assertRaisesRegex(ValueError, "上限"):
+            self.plugin._submit(event, "nai-diffusion-5-full", "third cat")
+        await self.plugin.queue.cancel(self.plugin._key(event))
         self.assertEqual(self.plugin.pending, 0)
-        self.assertFalse(self.plugin.user_tasks)
+        self.assertFalse(self.plugin.queue.tasks)
 
     async def test_translation_failure_does_not_charge(self):
         self.plugin.translator.translate = AsyncMock(side_effect=ValueError("translation blocked"))
-        with self.assertRaises(ValueError):
-            await self.plugin._execute(Event(), "nai-diffusion-5-full", "一只猫")
+        job = await self.execute(Event(), "nai-diffusion-5-full", "一只猫")
+        self.assertEqual(job["state"], "failed")
         self.plugin.router.generate.assert_not_awaited()
 
     async def test_gallery_never_calls_image_provider(self):

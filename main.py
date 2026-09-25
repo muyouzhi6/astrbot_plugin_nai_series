@@ -1,23 +1,25 @@
-"""Nai series commands: capture configuration once, await actual delivery."""
+"""Nai series commands and silent, durable background image tools."""
 
 import asyncio
 import hashlib
 import math
-import time
 import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image, Reply
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.star.filter.command import GreedyStr
 
+from .background import ACTIVE, LABELS, BackgroundQueue
 from .commands import generation_args, resolve_size
 from .gallery import render_gallery, save_preview
 from .models import (
     GenerationRequest,
+    Preset,
     SessionState,
     find_preset,
     model_family,
@@ -37,10 +39,7 @@ class NaiSeriesPlugin(Star):
         self.store = Store(StarTools.get_data_dir("astrbot_plugin_nai_series"))
         self.router = ProviderRouter(config)
         self.translator = PromptTranslator(config)
-        self.semaphore = asyncio.Semaphore(max(1, int(config.get("max_concurrency", 2))))
-        self.pending = 0
-        self.user_tasks = {}
-        self.cooldowns = {}
+        self.queue = BackgroundQueue(self.store, config, self._process_job)
         self._tool_names = []
         changed = False
         for preset in config.get("presets", []):
@@ -56,13 +55,100 @@ class NaiSeriesPlugin(Star):
             self._tool_names = [tool.name for tool in tools]
 
     async def terminate(self):
+        await self.queue.close()
         for name in self._tool_names:
-            self.context.provider_manager.llm_tools.remove_tool(name)
-        tasks = list(self.user_tasks.values())
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            self.context.provider_manager.llm_tools.remove_func(name)
+
+    async def initialize(self):
+        manager = getattr(self.context, "platform_manager", None)
+        if manager and getattr(manager, "platform_insts", []):
+            self.queue.start()
+
+    @filter.on_astrbot_loaded()
+    async def on_loaded(self):
+        self.queue.start()
+
+    @property
+    def pending(self):
+        return sum(job["state"] in ACTIVE for job in self.store.jobs())
+
+    @filter.on_llm_request()
+    async def silence_tool_status(self, event: AstrMessageEvent, req):
+        if not self.config.get("enable_llm_tool", False):
+            return
+        req.system_prompt = (
+            (req.system_prompt or "")
+            + "\n调用 nai4_generate_image 或 nai5_generate_image 时直接调用工具, 不输出开场白、进度或完成说明; 图片会单独发送."
+        )
+        if event.get_extra("_nai_send_guard"):
+            return
+        original_send = event.send
+
+        async def guarded_send(message):
+            if getattr(message, "type", None) == "tool_call":
+                content = str(getattr(message, "chain", ""))
+                if any(name in content for name in ("nai4_generate_image", "nai5_generate_image")):
+                    return
+            if event.get_extra("_nai_silent"):
+                message.chain = [part for part in message.chain if not isinstance(part, Plain)]
+                if not message.chain:
+                    return
+            return await original_send(message)
+
+        # Guard only this event, leaving other tools and all platform APIs untouched.
+        event.send = guarded_send
+        event.set_extra("_nai_original_send", original_send)
+        event.set_extra("_nai_send_guard", True)
+        original_stream = getattr(event, "send_streaming", None)
+        if original_stream:
+
+            async def guarded_stream(generator, use_fallback=False):
+                # Do not leak streamed preambles before the model chooses its tool.
+                buffered = [chain async for chain in generator]
+
+                async def replay():
+                    for chain in buffered:
+                        if not event.get_extra("_nai_silent"):
+                            yield chain
+
+                return await original_stream(replay(), use_fallback)
+
+            event.send_streaming = guarded_stream
+
+    @filter.on_using_llm_tool()
+    async def before_tool(self, event: AstrMessageEvent, tool, tool_args):
+        if not event.get_extra("_nai_send_guard"):
+            return
+        pending = event.get_extra("_nai_preamble", [])
+        event.set_extra("_nai_preamble", [])
+        if tool.name in ("nai4_generate_image", "nai5_generate_image"):
+            event.set_extra("_nai_silent", True)
+        elif pending:
+            await event.get_extra("_nai_original_send")(MessageChain(chain=pending))
+
+    @filter.on_agent_done()
+    async def agent_done(self, event: AstrMessageEvent, run_context, resp):
+        event.set_extra("_nai_agent_done", True)
+
+    @filter.on_decorating_result()
+    async def silence_tool_reply(self, event: AstrMessageEvent):
+        if not event.get_extra("_nai_send_guard") and not event.get_extra("_nai_silent"):
+            return
+        result = event.get_result()
+        if not result:
+            return
+        if event.get_extra("_nai_silent"):
+            result.chain = [part for part in result.chain if not isinstance(part, Plain)]
+            if not result.chain:
+                event.clear_result()
+        elif result.result_content_type == ResultContentType.LLM_RESULT:
+            pending = event.get_extra("_nai_preamble", [])
+            if not event.get_extra("_nai_agent_done"):
+                event.set_extra("_nai_preamble", pending + result.chain)
+                event.clear_result()
+            elif pending:
+                result.chain = pending + result.chain
+                event.set_extra("_nai_preamble", [])
 
     def _load_presets(self):
         return parse_presets(self.config.get("presets", []))
@@ -142,83 +228,102 @@ class NaiSeriesPlugin(Star):
         if allowed and event.get_sender_id() not in allowed and not event.is_admin():
             raise ValueError("当前用户未获得生图权限")
 
-    async def _execute(self, event, model, prompt, *, flags=None, snapshot=None, save_as=None):
+    def _submit(
+        self, event, model, prompt, *, flags=None, snapshot=None, save_as=None, silent=False
+    ):
         self._check_access(event)
-        key = self._key(event)
         flags = flags or {}
-        if key in self.user_tasks:
-            raise ValueError("你已有正在处理的生图请求")
-        if self.pending >= max(1, int(self.config.get("queue_limit", 10))):
-            raise ValueError("生图队列已满, 本次未提交")
-        remaining = float(self.config.get("user_cooldown", 10)) - (
-            time.monotonic() - self.cooldowns.get(key, 0)
-        )
-        if remaining > 0:
-            raise ValueError(f"生图冷却剩余 {math.ceil(remaining)} 秒")
         if not snapshot and (not prompt.strip() or len(prompt) > 12000):
             raise ValueError("请提供 1-12000 字符的画面描述")
-        # Snapshot the model, preset and parameters before waiting for the queue.
         preset = None if snapshot else self._preset(event, model, flags.get("preset"))
         draft = (
             GenerationRequest(**snapshot)
             if snapshot
             else self._request(model, prompt, preset, flags)
         )
-        self.pending += 1
-        self.user_tasks[key] = asyncio.current_task()
+        return self.queue.submit(
+            {
+                "owner": self._key(event),
+                "umo": event.unified_msg_origin,
+                "request": asdict(draft),
+                "original_prompt": prompt,
+                "artist": preset.artist_prompt if preset else "",
+                "raw": bool(snapshot or flags.get("raw")),
+                "silent": silent,
+                "preview": asdict(save_as) if save_as else None,
+            }
+        )
+
+    async def _send(self, umo, components):
+        matched = await asyncio.wait_for(
+            self.context.send_message(umo, MessageChain(chain=components)), timeout=120
+        )
+        if matched is False:
+            raise RuntimeError("platform_unavailable")
+
+    async def _process_job(self, job, queue):
         try:
-            if self.semaphore.locked():
-                await event.send(event.plain_result(f"已排队, 当前处理中 {self.pending} 个请求"))
-            async with self.semaphore:
-                translated = (
-                    prompt
-                    if snapshot or flags.get("raw")
-                    else await self.translator.translate(prompt)
-                )
+            if job["state"] != "generated":
+                queue.transition(job, "translating")
+                prompt = job["original_prompt"]
+                translated = prompt if job["raw"] else await self.translator.translate(prompt)
+                draft = GenerationRequest(**job["request"])
                 request = (
                     draft
-                    if snapshot
+                    if job["raw"]
                     else replace(
                         draft,
                         prompt=", ".join(
-                            p
-                            for p in (
-                                (preset.artist_prompt if preset else "").strip(),
-                                translated.strip(),
-                            )
-                            if p
+                            p for p in (job["artist"].strip(), translated.strip()) if p
                         ),
                     )
                 )
-                if translated != prompt and self.config.get("show_translated_prompt", True):
-                    await event.send(event.plain_result(f"翻译: {translated}"))
-                await event.send(
-                    event.plain_result(
-                        f"生成中: {request.model} | {request.size} | {request.steps} 步 | 预设 {preset.name if preset else '无或重绘快照'}"
-                    )
-                )
-                self.cooldowns[key] = time.monotonic()
+                if (
+                    not job["silent"]
+                    and translated != prompt
+                    and self.config.get("show_translated_prompt", False)
+                ):
+                    await self._send(job["umo"], [Plain(f"翻译: {translated}")])
+                queue.transition(job, "running", request=asdict(request))
                 images, _route = await self.router.generate(request)
                 if len(images) != 1:
                     raise GenerationError("接口返回图片数量与单张请求不一致")
-                state = self._state(event)
-                state.last_request = asdict(request)
-                self._persist(event, state)
-                if save_as:
+                path = self.store.image_path(job["id"])
+                temp = path.with_suffix(".tmp")
+                temp.write_bytes(images[0].data)
+                temp.chmod(0o600)
+                temp.replace(path)
+                state = self.store.get(job["owner"], {})
+                state["last_request"] = asdict(request)
+                self.store.put(job["owner"], state)
+                queue.transition(job, "generated")
+                if job["preview"]:
                     await asyncio.to_thread(
-                        save_preview, images[0].data, self.store.preview_path(save_as)
+                        save_preview,
+                        images[0].data,
+                        self.store.preview_path(Preset(**job["preview"])),
                     )
-                await event.send(event.chain_result([Image.fromBytes(images[0].data)]))
-                logger.info(
-                    "[NaiSeries] delivered model=%s size=%s preset=%s",
-                    request.model,
-                    request.size,
-                    preset.name if preset else "snapshot",
-                )
-                return f"图片已发送, 模型 {request.model}, 尺寸 {request.size}."
-        finally:
-            self.pending -= 1
-            self.user_tasks.pop(key, None)
+            image = await asyncio.to_thread(self.store.image_path(job["id"]).read_bytes)
+            queue.transition(job, "sending")
+            await self._send(job["umo"], [Image.fromBytes(image)])
+            queue.transition(job, "delivered")
+            logger.info(
+                "[NaiSeries] delivered task=%s model=%s", job["id"], job["request"]["model"]
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[NaiSeries] task=%s stage=%s error=%s", job["id"], job["state"], type(exc).__name__
+            )
+            if not job["silent"]:
+                try:
+                    await self._send(
+                        job["umo"], [Plain(f"任务 {job['id']} 未完成, 用 /nai任务 查看状态.")]
+                    )
+                except Exception:
+                    pass
+            raise
 
     async def _run(self, event, family, text):
         try:
@@ -226,7 +331,8 @@ class NaiSeriesPlugin(Star):
             model = self._model(flags.pop("model", family))
             if family in ("nai4", "nai5") and model_family(model) != family:
                 raise ValueError(f"请使用 /{model_family(model)} 调用另一模型族")
-            await self._execute(event, model, prompt, flags=flags)
+            task_id = self._submit(event, model, prompt, flags=flags)
+            yield event.plain_result(f"已提交 {task_id}, 图片完成后自动发送.")
         except (ValueError, GenerationError) as exc:
             yield event.plain_result(f"未完成: {exc}")
         except Exception:
@@ -369,13 +475,14 @@ class NaiSeriesPlugin(Star):
     async def cmd_sample(self, event: AstrMessageEvent, query: GreedyStr = GreedyStr):
         try:
             preset = self._query_preset(str(query))
-            await self._execute(
+            task_id = self._submit(
                 event,
                 self._model(preset.family),
                 preset.preview_prompt,
                 flags={"preset": preset.id, "size": preset.preview_size},
                 save_as=preset,
             )
+            yield event.plain_result(f"已提交样图任务 {task_id}.")
         except (ValueError, GenerationError) as exc:
             yield event.plain_result(str(exc))
 
@@ -415,7 +522,8 @@ class NaiSeriesPlugin(Star):
             yield event.plain_result("当前会话没有历史生图请求")
             return
         try:
-            await self._execute(event, snapshot["model"], "", snapshot=snapshot)
+            task_id = self._submit(event, snapshot["model"], "", snapshot=snapshot)
+            yield event.plain_result(f"已提交重绘任务 {task_id}.")
         except (ValueError, GenerationError) as exc:
             yield event.plain_result(str(exc))
 
@@ -430,32 +538,69 @@ class NaiSeriesPlugin(Star):
             yield event.plain_result(text[start : start + 1800])
 
     @filter.command("nai取消")
-    async def cmd_cancel(self, event: AstrMessageEvent):
-        task = self.user_tasks.get(self._key(event))
-        if task and not task.done():
-            task.cancel()
-            yield event.plain_result("已取消本地等待; 若上游已接单, 可能仍生成并计费")
+    async def cmd_cancel(self, event: AstrMessageEvent, task_id: str = ""):
+        count = await self.queue.cancel(self._key(event), task_id.strip())
+        if count:
+            yield event.plain_result(f"已取消 {count} 个本地任务; 已提交的任务仍可能计费.")
         else:
             yield event.plain_result("当前没有你的待处理任务")
+
+    @filter.command("nai任务")
+    async def cmd_tasks(self, event: AstrMessageEvent):
+        jobs = self.store.jobs(self._key(event), limit=8)
+        rejected = self.store.get("rejected:" + self._key(event), "")
+        yield event.plain_result(
+            "\n".join(
+                f"{j['id']} | {j['request']['model']} | {LABELS.get(j['state'], j['state'])}"
+                for j in jobs
+            )
+            + (f"\n上次未提交: {rejected}" if rejected else "")
+            or "当前没有生图任务"
+        )
+
+    @filter.command("nai取图")
+    async def cmd_retrieve(self, event: AstrMessageEvent, task_id: str):
+        job = self.store.job(task_id.strip(), self._key(event))
+        if not job or not self.store.image_path(job["id"]).is_file():
+            yield event.plain_result("未找到可取回的图片, 请用 /nai任务 查看任务编号.")
+            return
+        if job["state"] in ACTIVE:
+            yield event.plain_result("任务正在处理, 请稍后取图.")
+            return
+        data = await asyncio.to_thread(self.store.image_path(job["id"]).read_bytes)
+        yield event.chain_result([Image.fromBytes(data)])
 
     @filter.command("nai帮助")
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "Nai系列生图\n/nai4 描述 或 /nai5 描述\n选项放描述后: --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai取消\n设置按当前用户和会话分别保存, 两模型预设互不影响."
+            "Nai系列生图\n/nai4 描述 或 /nai5 描述\n选项放描述后: --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
         )
 
     async def generate_as_tool(self, event, family, kwargs):
+        event.set_extra("_nai_silent", True)
+        event.clear_result()
         if not self.config.get("enable_llm_tool", False):
-            return "未执行, LLM 生图工具未开启"
+            return None
         try:
-            return await self._execute(
+            signature = hashlib.sha256(repr((family, kwargs)).encode()).hexdigest()
+            submitted = event.get_extra("_nai_submitted", {})
+            if signature in submitted:
+                return None
+            task_id = self._submit(
                 event,
                 self._model(family),
                 str(kwargs.get("prompt", "")),
                 flags={"preset": kwargs["preset"]} if kwargs.get("preset") else {},
+                silent=True,
             )
+            submitted[signature] = task_id
+            event.set_extra("_nai_submitted", submitted)
+            self.store.put("rejected:" + self._key(event), "")
         except (ValueError, GenerationError) as exc:
-            return f"未完成: {exc}"
+            event.set_extra("_nai_rejected", str(exc))
+            self.store.put("rejected:" + self._key(event), str(exc))
+            logger.info("[NaiSeries] tool rejected: %s", type(exc).__name__)
         except Exception:
-            logger.exception("[NaiSeries] tool delivery failed")
-            return "生成或发送失败, 没有自动重试"
+            logger.warning("[NaiSeries] tool submission failed")
+        # AstrBot treats None as a direct-result tool and ends the agent loop.
+        return None
