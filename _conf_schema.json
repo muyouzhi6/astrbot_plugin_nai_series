@@ -1,0 +1,78 @@
+{
+  "primary_base_url": {"description": "第一图片连接地址", "type": "string", "hint": "OpenAI Images 兼容接口, 例如 https://meinianda.top/v1", "default": "https://meinianda.top/v1"},
+  "primary_api_key": {"description": "第一图片连接密钥", "type": "string", "hint": "只保存在 AstrBot 配置, 不要提交到仓库", "default": ""},
+  "secondary_base_url": {"description": "第二图片连接地址", "type": "string", "hint": "OpenAI Images 兼容接口, 例如 https://love.auroralove.cc/api/v1", "default": "https://love.auroralove.cc/api/v1"},
+  "secondary_api_key": {"description": "第二图片连接密钥", "type": "string", "hint": "只保存在 AstrBot 配置, 不要提交到仓库", "default": ""},
+  "third_base_url": {"description": "第三图片连接地址", "type": "string", "hint": "可选, 例如 https://image.novelai.net. 根据地址自动选择接口格式", "default": ""},
+  "third_api_key": {"description": "第三图片连接密钥", "type": "string", "default": ""},
+  "request_timeout": {"description": "图片请求超时秒数", "type": "int", "default": 300, "slider": {"min": 30, "max": 900, "step": 30}},
+  "max_concurrency": {"description": "最大并发生成数", "type": "int", "hint": "按账号和服务商容量调整", "default": 2, "slider": {"min": 1, "max": 8, "step": 1}},
+  "user_cooldown": {"description": "用户冷却秒数", "type": "int", "default": 10, "slider": {"min": 0, "max": 300, "step": 5}},
+  "default_model": {"description": "默认模型", "type": "string", "hint": "nai4, nai5, curated 或完整模型名", "default": "nai4"},
+  "model_nai4": {"description": "nai4 指令模型名", "type": "string", "default": "nai-diffusion-4-5-full", "hint": "可改为 nai-diffusion-4-5-curated, 不会被自动覆盖"},
+  "model_nai5": {"description": "nai5 指令模型名", "type": "string", "default": "nai-diffusion-5-full"},
+  "queue_limit": {"description": "队列容量(含处理中)", "type": "int", "default": 10},
+  "admin_only": {"description": "仅管理员可生图", "type": "bool", "default": false},
+  "allowed_users": {"description": "允许生图的用户 ID", "type": "list", "default": [], "hint": "留空允许所有用户, 管理员不受此列表限制"},
+  "gallery_font": {"description": "图册中文字体文件", "type": "string", "default": "", "hint": "留空查找系统中文字体, 无中文字体时请安装 Noto CJK"},
+  "size_nai4": {"description": "NAI 4.5 默认尺寸", "type": "string", "default": "竖图"},
+  "size_nai5": {"description": "NAI 5 默认尺寸", "type": "string", "default": "竖图"},
+  "steps_nai4": {"description": "NAI 4.5 默认步数", "type": "int", "default": 23, "slider": {"min": 1, "max": 50, "step": 1}},
+  "steps_nai5": {"description": "NAI 5 默认步数", "type": "int", "default": 28, "slider": {"min": 1, "max": 50, "step": 1}},
+  "scale_nai4": {"description": "NAI 4.5 CFG", "type": "float", "default": 5.0},
+  "scale_nai5": {"description": "NAI 5 CFG", "type": "float", "default": 5.0},
+  "sampler_nai4": {"description": "NAI 4.5 sampler", "type": "string", "default": "k_euler_ancestral"},
+  "sampler_nai5": {"description": "NAI 5 sampler", "type": "string", "default": "k_euler_ancestral"},
+  "noise_schedule_nai4": {"description": "NAI 4.5 noise schedule", "type": "string", "default": "karras"},
+  "noise_schedule_nai5": {"description": "NAI 5 noise schedule", "type": "string", "default": "karras"},
+  "negative_prompt_nai4": {"description": "NAI 4.5 默认负面提示词", "type": "string", "default": ""},
+  "negative_prompt_nai5": {"description": "NAI 5 默认负面提示词", "type": "string", "default": ""},
+  "default_preset_nai4": {"description": "NAI 4.5 默认预设", "type": "string", "default": ""},
+  "default_preset_nai5": {"description": "NAI 5 默认预设", "type": "string", "default": ""},
+  "presets": {
+    "description": "模型专属预设列表",
+    "type": "template_list",
+    "templates": {
+      "nai4": {
+        "name": "NAI 4.5 预设",
+        "display_item": "name",
+        "items": {
+          "name": {"description": "预设名称", "type": "string", "default": ""},
+          "id": {"description": "稳定 ID", "type": "string", "default": ""},
+          "model": {"description": "模型", "type": "string", "default": "nai4"},
+          "artist_prompt": {"description": "画师串", "type": "text", "default": ""},
+          "negative_prompt": {"description": "该预设负面提示词", "type": "text", "default": ""},
+          "preview_prompt": {"description": "展示图 prompt", "type": "string", "default": "solo, 1girl, portrait, looking at viewer"},
+          "preview_size": {"description": "展示图尺寸", "type": "string", "default": "832x1216"},
+          "description": {"description": "预设说明", "type": "string", "default": ""}
+        }
+      },
+      "nai5": {
+        "name": "NAI 5 预设",
+        "display_item": "name",
+        "items": {
+          "name": {"description": "预设名称", "type": "string", "default": ""},
+          "id": {"description": "稳定 ID", "type": "string", "default": ""},
+          "model": {"description": "模型", "type": "string", "default": "nai5"},
+          "artist_prompt": {"description": "画师串", "type": "text", "default": ""},
+          "negative_prompt": {"description": "该预设负面提示词", "type": "text", "default": ""},
+          "preview_prompt": {"description": "展示图 prompt", "type": "string", "default": "solo, 1girl, portrait, looking at viewer"},
+          "preview_size": {"description": "展示图尺寸", "type": "string", "default": "832x1216"},
+          "description": {"description": "预设说明", "type": "string", "default": ""}
+        }
+      }
+    },
+    "default": []
+  },
+  "translator_enabled": {"description": "启用自然语言翻译", "type": "bool", "default": true},
+  "translator_base_url": {"description": "翻译模型 API 地址", "type": "string", "default": ""},
+  "translator_api_key": {"description": "翻译模型 API 密钥", "type": "string", "default": ""},
+  "translator_model": {"description": "翻译模型名", "type": "string", "default": "gpt-4o-mini"},
+  "translator_timeout": {"description": "翻译超时秒数", "type": "int", "default": 45},
+  "translator_system_prompt": {"description": "自定义翻译系统提示词", "type": "text", "hint": "留空使用忠实翻译默认 prompt, 可自行改写", "default": ""},
+  "translator_custom_prefix": {"description": "翻译提示词前缀", "type": "string", "default": ""},
+  "show_translated_prompt": {"description": "显示翻译结果", "type": "bool", "default": true},
+  "enable_llm_tool": {"description": "允许 LLM 调用 Nai 生图工具", "type": "bool", "hint": "开启后注册 nai4_generate_image 和 nai5_generate_image, 默认关闭", "default": false},
+  "cfg_rescale_nai4": {"description": "NAI 4.5 CFG Rescale", "type": "float", "default": 0},
+  "cfg_rescale_nai5": {"description": "NAI 5 CFG Rescale", "type": "float", "default": 0}
+}
