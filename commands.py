@@ -5,7 +5,7 @@ import re
 
 def generation_args(text):
     flags = {}
-    pattern = r"(?:^|\s)--(raw|preset|model|size|steps|scale)(?=\s|$)"
+    pattern = r"(?:^|\s)--(raw|preset|model|size|steps|scale|count)(?=\s|$)"
     matches = list(re.finditer(pattern, text))
     if not matches:
         return text.strip(), flags

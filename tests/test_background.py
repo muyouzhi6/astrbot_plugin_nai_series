@@ -5,7 +5,7 @@ import time
 import unittest
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import test_behavior as behavior
 from astrbot_plugin_nai_series.background import BackgroundQueue
@@ -22,6 +22,108 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = behavior.PluginTests.asyncTearDown
     finish = behavior.PluginTests.finish
     execute = behavior.PluginTests.execute
+
+    async def test_batch_atomic_limits_and_concurrent_delivery(self):
+        self.plugin.config.update(max_user_tasks=4, queue_limit=4, batch_max_count=4)
+        gate = asyncio.Event()
+
+        async def generate(request):
+            await gate.wait()
+            return [GeneratedImage(png())], "test"
+
+        self.plugin.router.generate.side_effect = generate
+        event = Event()
+        ids = self.plugin._submit(event, "nai-diffusion-5-full", "cat", count=4)
+        self.assertEqual(len(ids), 4)
+        self.assertEqual(len(self.plugin.store.jobs()), 4)
+        with self.assertRaisesRegex(ValueError, "队列已满"):
+            self.plugin._submit(event, "nai-diffusion-5-full", "dog")
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.plugin.router.generate.await_count, 2)
+        gate.set()
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.await_count, 4)
+        self.assertEqual(self.plugin.context.send_message.await_count, 4)
+        self.assertTrue(all(j["state"] == "delivered" for j in self.plugin.store.jobs()))
+
+    async def test_batch_completion_once_and_conversation_change_gate(self):
+        self.plugin.config.update(max_user_tasks=4, enable_llm_tool=True)
+        self.plugin.queue.completed = self.plugin._completed
+        conversation = object()
+        manager = SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="conversation-1"),
+            get_conversation=AsyncMock(return_value=conversation),
+        )
+        adapter = SimpleNamespace(create_event=MagicMock(), commit_event=MagicMock())
+        synthetic = Event()
+        synthetic.request_llm = MagicMock(return_value=SimpleNamespace())
+        adapter.create_event.return_value = synthetic
+        self.plugin.context.conversation_manager = manager
+        self.plugin.context.get_platform_inst = lambda platform_id: adapter
+        target = dict(
+            conversation_id="conversation-1",
+            platform_id="QQ",
+            message_type="GroupMessage",
+            self_id="42",
+            session_id="123",
+            sender_id="1",
+            sender_name="tester",
+            group_id="123",
+            source_message_id="456",
+        )
+        event = Event()
+        ids = self.plugin._submit(
+            event, "nai-diffusion-5-full", "猫", count=3, completion=target, origin="tool"
+        )
+        await self.finish()
+        adapter.commit_event.assert_called_once()
+        self.assertEqual(adapter.create_event.call_args.args[0].message[1].id, "456")
+        self.assertEqual(synthetic.request_llm.call_args.kwargs["conversation"], conversation)
+        self.assertIn("用户描述 猫", synthetic.request_llm.call_args.kwargs["prompt"])
+        self.assertEqual(
+            self.plugin.store.get(
+                "completion:" + self.plugin.store.job(ids[0], self.plugin._key(event))["batch_id"]
+            ),
+            True,
+        )
+        req = SimpleNamespace(system_prompt="", func_tool=None)
+        await self.plugin.silence_tool_status(event, req)
+        self.assertIn("实际提示词", req.system_prompt)
+
+        manager.get_curr_conversation_id.return_value = "conversation-2"
+        self.plugin._submit(event, "nai-diffusion-5-full", "dog", completion=target, origin="tool")
+        await self.finish()
+        adapter.commit_event.assert_called_once()
+
+    async def test_only_tool_jobs_appear_in_llm_context_even_after_commands(self):
+        self.plugin.config.update(enable_llm_tool=True, max_user_tasks=8)
+        event = Event()
+        self.plugin._submit(event, "nai-diffusion-5-full", "bot画的猫", origin="tool")
+        await self.finish()
+        for number in range(5):
+            self.plugin._submit(event, "nai-diffusion-5-full", f"用户指令{number}")
+        await self.finish()
+        req = SimpleNamespace(system_prompt="", func_tool=None)
+        await self.plugin.silence_tool_status(event, req)
+        self.assertIn("bot画的猫", req.system_prompt)
+        self.assertNotIn("用户指令", req.system_prompt)
+
+    async def test_command_task_never_dispatches_completion_even_with_target(self):
+        self.plugin.queue.completed = self.plugin._completed
+        event = Event()
+        target = {"conversation_id": "unchanged"}
+        self.plugin.context.conversation_manager = SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="unchanged")
+        )
+        self.plugin._submit(event, "nai-diffusion-5-full", "指令画的猫", completion=target)
+        await self.finish()
+        self.plugin.context.conversation_manager.get_curr_conversation_id.assert_not_awaited()
+
+    async def test_invalid_batch_rejects_without_partial_submission(self):
+        event = Event()
+        with self.assertRaisesRegex(ValueError, "每次可生成"):
+            self.plugin._submit(event, "nai-diffusion-5-full", "cat", count=9)
+        self.assertEqual(self.plugin.store.jobs(), [])
 
     async def test_tool_returns_immediately_and_sends_only_image(self):
         self.plugin.config.update(enable_llm_tool=True, show_translated_prompt=True)
@@ -75,6 +177,32 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat"})
         await self.finish()
         self.assertEqual(self.plugin.router.generate.await_count, 1)
+
+    async def test_llm_batch_count_and_same_turn_deduplication(self):
+        self.plugin.config.update(enable_llm_tool=True, max_user_tasks=4)
+        event = Event()
+        kwargs = {"prompt": "三张橘猫", "count": 3}
+        self.assertIsNone(await self.plugin.generate_as_tool(event, "nai5", kwargs))
+        self.assertIsNone(await self.plugin.generate_as_tool(event, "nai5", kwargs))
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.await_count, 3)
+        self.assertEqual(self.plugin.context.send_message.await_count, 3)
+        self.assertEqual(len(self.plugin.store.jobs(self.plugin._key(event))), 3)
+
+    def test_tool_description_teaches_english_tags_and_matches_batch_limit(self):
+        from astrbot_plugin_nai_series.tools import make_tools
+
+        self.plugin.config["batch_max_count"] = 4
+        for tool in make_tools(self.plugin):
+            self.assertIn("英文 Danbooru", tool.description)
+            self.assertIn("数量、位置、否定", tool.description)
+            self.assertIn("画师串和负面词由插件", tool.description)
+            self.assertIn(
+                "英文 NAI 正向 tags", tool.parameters["properties"]["prompt"]["description"]
+            )
+            self.assertEqual(tool.parameters["properties"]["count"]["maximum"], 4)
+        self.plugin.config["batch_max_count"] = 6
+        self.assertEqual(make_tools(self.plugin)[0].parameters["properties"]["count"]["maximum"], 6)
 
     async def test_snapshot_survives_preset_and_model_edits_in_queue(self):
         self.plugin.translator.translate = AsyncMock(return_value="translated cat")

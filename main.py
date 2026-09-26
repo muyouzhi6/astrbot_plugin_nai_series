@@ -3,15 +3,17 @@
 import asyncio
 import hashlib
 import math
+import re
 import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain, Reply
+from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import ResultContentType
+from astrbot.core.platform.astrbot_message import MessageMember
 from astrbot.core.star.filter.command import GreedyStr
 
 from .background import ACTIVE, LABELS, BackgroundQueue
@@ -32,6 +34,11 @@ from .tools import make_tools
 from .translator import PromptTranslator
 
 
+class BatchCommandWakeFilter(filter.CustomFilter):
+    def filter(self, event, cfg):
+        return bool(event.is_at_or_wake_command)
+
+
 class NaiSeriesPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -39,7 +46,7 @@ class NaiSeriesPlugin(Star):
         self.store = Store(StarTools.get_data_dir("astrbot_plugin_nai_series"))
         self.router = ProviderRouter(config)
         self.translator = PromptTranslator(config)
-        self.queue = BackgroundQueue(self.store, config, self._process_job)
+        self.queue = BackgroundQueue(self.store, config, self._process_job, self._completed)
         self._tool_names = []
         changed = False
         for preset in config.get("presets", []):
@@ -74,11 +81,28 @@ class NaiSeriesPlugin(Star):
 
     @filter.on_llm_request()
     async def silence_tool_status(self, event: AstrMessageEvent, req):
+        if event.get_extra("_nai_completion", False):
+            if req.func_tool:
+                for name in ("nai4_generate_image", "nai5_generate_image"):
+                    req.func_tool.remove_tool(name)
+            return
+        recent = self.store.jobs(self._key(event), limit=4, origin="tool")
+        facts = [
+            f"{j['request']['model']}: {j['state']}, 原描述 {j.get('original_prompt', '')[:500]}, "
+            f"实际提示词 {j['request']['prompt'][:700]}"
+            for j in recent
+            if j.get("state") in {"delivered", "generated", "sending", "send_unknown", "failed"}
+        ]
+        if facts:
+            req.system_prompt = (req.system_prompt or "") + (
+                "\n你最近为当前用户处理的生图记录(以任务状态为准, 不要声称看到了图像细节):\n"
+                + "\n".join(facts)
+            )
         if not self.config.get("enable_llm_tool", False):
             return
         req.system_prompt = (
             (req.system_prompt or "")
-            + "\n调用 nai4_generate_image 或 nai5_generate_image 时直接调用工具, 不输出开场白、进度或完成说明; 图片会单独发送."
+            + "\n调用 nai4_generate_image 或 nai5_generate_image 时直接调用工具, 不输出开场白或进度; 图片完成后会在原会话自然接话."
         )
         if event.get_extra("_nai_send_guard"):
             return
@@ -229,7 +253,18 @@ class NaiSeriesPlugin(Star):
             raise ValueError("当前用户未获得生图权限")
 
     def _submit(
-        self, event, model, prompt, *, flags=None, snapshot=None, save_as=None, silent=False
+        self,
+        event,
+        model,
+        prompt,
+        *,
+        flags=None,
+        snapshot=None,
+        save_as=None,
+        silent=False,
+        count=1,
+        completion=None,
+        origin="command",
     ):
         self._check_access(event)
         flags = flags or {}
@@ -241,7 +276,9 @@ class NaiSeriesPlugin(Star):
             if snapshot
             else self._request(model, prompt, preset, flags)
         )
-        return self.queue.submit(
+        count = self._count(count)
+        batch_id = uuid.uuid4().hex[:12] if count > 1 else ""
+        payloads = [
             {
                 "owner": self._key(event),
                 "umo": event.unified_msg_origin,
@@ -251,8 +288,118 @@ class NaiSeriesPlugin(Star):
                 "raw": bool(snapshot or flags.get("raw")),
                 "silent": silent,
                 "preview": asdict(save_as) if save_as else None,
+                "batch_id": batch_id,
+                "batch_count": count,
+                "completion": completion if origin == "tool" else None,
+                "origin": origin,
             }
+            for _ in range(count)
+        ]
+        ids = self.queue.submit_many(payloads)
+        return ids[0] if count == 1 else ids
+
+    def _count(self, value):
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("生图数量必须是整数") from None
+        limit = max(1, min(8, int(self.config.get("batch_max_count", 4))))
+        if not 1 <= count <= limit:
+            raise ValueError(f"每次可生成 1-{limit} 张")
+        return count
+
+    async def _completion_target(self, event):
+        manager = getattr(self.context, "conversation_manager", None)
+        message = getattr(event, "message_obj", None)
+        if manager is None or message is None:
+            return None
+        try:
+            cid = await manager.get_curr_conversation_id(event.unified_msg_origin)
+        except Exception:
+            return None
+        if not cid:
+            return None
+        return {
+            "conversation_id": str(cid),
+            "platform_id": event.get_platform_id(),
+            "message_type": event.get_message_type().value,
+            "self_id": str(message.self_id),
+            "session_id": str(message.session_id),
+            "sender_id": str(event.get_sender_id()),
+            "sender_name": str(event.get_sender_name() or ""),
+            "group_id": str(message.group_id or ""),
+            "source_message_id": str(message.message_id or ""),
+        }
+
+    async def _completed(self, job):
+        if job.get("origin") != "tool":
+            return
+        target = job.get("completion")
+        if not target or job["state"] in ACTIVE:
+            return
+        batch_id = job.get("batch_id")
+        jobs = (
+            [j for j in self.store.jobs(job["owner"]) if j.get("batch_id") == batch_id]
+            if batch_id
+            else [job]
         )
+        if len(jobs) != job.get("batch_count", 1) or any(j["state"] in ACTIVE for j in jobs):
+            return
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is None:
+            return
+        try:
+            cid = await manager.get_curr_conversation_id(job["umo"])
+            if str(cid or "") != target["conversation_id"]:
+                return
+            conversation = await manager.get_conversation(job["umo"], cid)
+            adapter = self.context.get_platform_inst(target["platform_id"])
+            if conversation is None or adapter is None:
+                return
+            facts = "\n".join(
+                f"{j['id']}: 模型 {j['request']['model']}, 状态 {j['state']}, "
+                f"用户描述 {j.get('original_prompt', '')[:500]}, "
+                f"实际提示词 {j['request']['prompt'][:700]}"
+                for j in reversed(jobs)
+            )
+            chain = [At(qq=target["self_id"])] if target["group_id"] else []
+            if target.get("source_message_id"):
+                chain.append(
+                    Reply(
+                        id=target["source_message_id"],
+                        sender_id=target["sender_id"],
+                        sender_nickname=target["sender_name"],
+                        message_str="",
+                    )
+                )
+            abm = await StarTools.create_message(
+                type=target["message_type"],
+                self_id=target["self_id"],
+                session_id=target["session_id"],
+                sender=MessageMember(user_id=target["sender_id"], nickname=target["sender_name"]),
+                message=chain,
+                message_str="",
+                group_id=target["group_id"],
+            )
+            event = adapter.create_event(abm)
+            event.is_wake = True
+            event.is_at_or_wake_command = True
+            event.set_extra("_nai_completion", True)
+            event.set_extra("_nai_completion_batch", batch_id or job["id"])
+            req = event.request_llm(
+                prompt=(
+                    "后台生图已结束. 根据以下真实任务记录, 用原有人格自然地对原用户说一句话. "
+                    "图已经单独发送; 不再调用生图工具, 不要输出任务编号或机械的状态播报, "
+                    "不要臆测提示词以外的画面细节.\n" + facts
+                ),
+                conversation=conversation,
+            )
+            if not self.store.claim("completion:" + (batch_id or job["id"])):
+                return
+            event.set_extra("provider_request", req)
+            adapter.commit_event(event)
+        except Exception:
+            logger.exception("[NaiSeries] completion callback failed for task=%s", job["id"])
 
     async def _send(self, umo, components):
         matched = await asyncio.wait_for(
@@ -325,14 +472,31 @@ class NaiSeriesPlugin(Star):
                     pass
             raise
 
-    async def _run(self, event, family, text):
+    async def _run(self, event, family, text, count_override=None):
+        event.should_call_llm(True)
         try:
             prompt, flags = generation_args(text)
+            flagged_count = flags.pop("count", None)
+            if count_override is not None and flagged_count is not None:
+                raise ValueError("批量指令已指定数量, 不要再写 --count")
+            count = self._count(
+                count_override
+                if count_override is not None
+                else flagged_count
+                if flagged_count is not None
+                else 1
+            )
             model = self._model(flags.pop("model", family))
             if family in ("nai4", "nai5") and model_family(model) != family:
                 raise ValueError(f"请使用 /{model_family(model)} 调用另一模型族")
-            task_id = self._submit(event, model, prompt, flags=flags)
-            yield event.plain_result(f"已提交 {task_id}, 图片完成后自动发送.")
+            self._submit(
+                event,
+                model,
+                prompt,
+                flags=flags,
+                count=count,
+            )
+            yield event.plain_result(f"已提交 {count} 张, 图片完成后自动发送.")
         except (ValueError, GenerationError) as exc:
             yield event.plain_result(f"未完成: {exc}")
         except Exception:
@@ -349,6 +513,15 @@ class NaiSeriesPlugin(Star):
     @filter.command("nai5")
     async def cmd_nai5(self, event: AstrMessageEvent, prompt: GreedyStr = GreedyStr):
         async for item in self._run(event, "nai5", str(prompt or "")):
+            yield item
+
+    @filter.regex(r"^\d+nai[45](?:\s|$)")
+    @filter.custom_filter(BatchCommandWakeFilter)
+    async def cmd_batch(self, event: AstrMessageEvent):
+        match = re.fullmatch(r"(\d+)nai([45])(?:\s+([\s\S]*))?", event.get_message_str().strip())
+        if match is None:
+            return
+        async for item in self._run(event, "nai" + match[2], match[3] or "", match[1]):
             yield item
 
     @filter.command("nai生图")
@@ -473,6 +646,7 @@ class NaiSeriesPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("nai预设试画")
     async def cmd_sample(self, event: AstrMessageEvent, query: GreedyStr = GreedyStr):
+        event.should_call_llm(True)
         try:
             preset = self._query_preset(str(query))
             task_id = self._submit(
@@ -517,6 +691,7 @@ class NaiSeriesPlugin(Star):
 
     @filter.command("nai重绘")
     async def cmd_reroll(self, event: AstrMessageEvent):
+        event.should_call_llm(True)
         snapshot = self._state(event).last_request
         if not snapshot:
             yield event.plain_result("当前会话没有历史生图请求")
@@ -573,15 +748,18 @@ class NaiSeriesPlugin(Star):
     @filter.command("nai帮助")
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "Nai系列生图\n/nai4 描述 或 /nai5 描述\n选项放描述后: --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
+            "Nai系列生图\n/nai4 描述 或 /nai5 描述\n批量: /3nai4 描述 或 /3nai5 描述\n选项放描述后: --count 3 --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
         )
 
     async def generate_as_tool(self, event, family, kwargs):
+        if event.get_extra("_nai_completion", False):
+            return None
         event.set_extra("_nai_silent", True)
         event.clear_result()
         if not self.config.get("enable_llm_tool", False):
             return None
         try:
+            count = self._count(kwargs.get("count", 1))
             signature = hashlib.sha256(repr((family, kwargs)).encode()).hexdigest()
             submitted = event.get_extra("_nai_submitted", {})
             if signature in submitted:
@@ -592,6 +770,9 @@ class NaiSeriesPlugin(Star):
                 str(kwargs.get("prompt", "")),
                 flags={"preset": kwargs["preset"]} if kwargs.get("preset") else {},
                 silent=True,
+                count=count,
+                completion=await self._completion_target(event),
+                origin="tool",
             )
             submitted[signature] = task_id
             event.set_extra("_nai_submitted", submitted)

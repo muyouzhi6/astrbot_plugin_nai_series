@@ -24,8 +24,9 @@ LABELS = {
 
 
 class BackgroundQueue:
-    def __init__(self, store, config, execute):
+    def __init__(self, store, config, execute, completed=None):
         self.store, self.config, self.execute = store, config, execute
+        self.completed = completed
         self.tasks = {}
         self.semaphore = asyncio.Semaphore(max(1, int(config.get("max_concurrency", 2))))
         self.lock = None
@@ -61,6 +62,11 @@ class BackgroundQueue:
                 self.transition(job, "send_unknown")
 
     def submit(self, payload):
+        return self.submit_many([payload])[0]
+
+    def submit_many(self, payloads):
+        if not payloads:
+            raise ValueError("批量任务不能为空")
         self.start()
         if time.time() - self.last_cleanup > 3600:
             self.store.prune_jobs(
@@ -68,19 +74,32 @@ class BackgroundQueue:
             )
             self.last_cleanup = time.time()
         active = [j for j in self.store.jobs() if j["state"] in ACTIVE]
-        if len(active) >= max(1, int(self.config.get("queue_limit", 10))):
+        if len(active) + len(payloads) > max(1, int(self.config.get("queue_limit", 10))):
             raise ValueError("生图队列已满, 本次未提交")
-        mine = [j for j in active if j["owner"] == payload["owner"]]
-        if len(mine) >= max(1, int(self.config.get("max_user_tasks", 2))):
+        owner = payloads[0]["owner"]
+        if any(p["owner"] != owner for p in payloads):
+            raise ValueError("批量任务必须属于同一会话")
+        mine = [j for j in active if j["owner"] == owner]
+        if len(mine) + len(payloads) > max(1, int(self.config.get("max_user_tasks", 2))):
             raise ValueError("你的待处理任务已达上限")
-        recent = self.store.jobs(payload["owner"], limit=1)
+        recent = self.store.jobs(owner, limit=1)
         cooldown = max(0, float(self.config.get("user_cooldown", 0)))
         if recent and time.time() - recent[0]["created"] < cooldown:
             raise ValueError("生图冷却中, 请稍后再试")
-        job = {**payload, "id": uuid.uuid4().hex[:12], "state": "queued", "created": time.time()}
-        self.store.save_job(job)
-        self._spawn(job)
-        return job["id"]
+        created = time.time()
+        jobs = [
+            {
+                **payload,
+                "id": uuid.uuid4().hex[:12],
+                "state": "queued",
+                "created": created + i * 0.000001,
+            }
+            for i, payload in enumerate(payloads)
+        ]
+        self.store.save_jobs(jobs)
+        for job in jobs:
+            self._spawn(job)
+        return [job["id"] for job in jobs]
 
     def _spawn(self, job):
         self.tasks[job["id"]] = asyncio.create_task(self._run(job), name="nai-" + job["id"])
@@ -109,6 +128,13 @@ class BackgroundQueue:
             self.transition(job, state, error=type(exc).__name__)
         finally:
             self.tasks.pop(job["id"], None)
+            if self.completed and not self.closed:
+                try:
+                    await self.completed(job)
+                except Exception:
+                    import logging
+
+                    logging.getLogger(__name__).exception("NAI completion dispatch failed")
 
     async def cancel(self, owner, task_id=""):
         selected = [

@@ -54,6 +54,9 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(text, "1.8::artist:foo::, a cat")
         self.assertEqual(flags, {"preset": "黑白 风格", "raw": True, "size": "640x640"})
 
+    def test_batch_count_flag(self):
+        self.assertEqual(generation_args("猫 --count 3"), ("猫", {"count": "3"}))
+
     def test_invalid_generation_rejected(self):
         for kwargs in [{"steps": 0}, {"width": 833}, {"scale": 40}]:
             with self.assertRaises(ValueError):
@@ -121,6 +124,10 @@ class Event:
         self.messages = []
         self.extra = {}
         self.result = None
+        self.call_llm = False
+
+    def should_call_llm(self, value):
+        self.call_llm = value
 
     def set_extra(self, key, value):
         self.extra[key] = value
@@ -211,6 +218,47 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.prompt, f"style{family[-1]}, cat")
             self.assertEqual(request.negative_prompt, f"bad{family[-1]}")
         self.assertEqual(self.plugin.context.send_message.await_count, 2)
+
+    async def test_numbered_commands_generate_batch_without_bot_context(self):
+        self.plugin.config.update(max_user_tasks=8, enable_llm_tool=True)
+        event = Event()
+        for family, count in (("nai4", 2), ("nai5", 3)):
+            event.get_message_str = lambda family=family, count=count: f"{count}{family} 猫 --raw"
+            results = [item async for item in self.plugin.cmd_batch(event)]
+            self.assertIn(f"已提交 {count} 张", results[0])
+            self.assertTrue(event.call_llm)
+        await self.finish()
+        jobs = self.plugin.store.jobs(self.plugin._key(event))
+        self.assertEqual(len(jobs), 5)
+        self.assertTrue(all(j["origin"] == "command" and j["completion"] is None for j in jobs))
+        self.assertEqual(self.plugin.router.generate.await_count, 5)
+        req = SimpleNamespace(system_prompt="original", func_tool=None)
+        await self.plugin.silence_tool_status(event, req)
+        self.assertNotIn("猫", req.system_prompt)
+
+    async def test_numbered_command_rejects_duplicate_count_and_limit(self):
+        self.plugin.config.update(max_user_tasks=8, batch_max_count=4)
+        event = Event()
+        for text, reason in (("5nai5 猫", "1-4"), ("3nai4 猫 --count 2", "不要再写")):
+            event.get_message_str = lambda text=text: text
+            results = [item async for item in self.plugin.cmd_batch(event)]
+            self.assertIn(reason, results[0])
+        self.assertEqual(self.plugin.store.jobs(), [])
+
+    def test_numbered_command_requires_real_wake_and_full_token(self):
+        from astrbot.core.star.filter.regex import RegexFilter
+        from astrbot_plugin_nai_series.main import BatchCommandWakeFilter
+
+        gate = BatchCommandWakeFilter()
+        regex = RegexFilter(r"^\d+nai[45](?:\s|$)")
+        event = SimpleNamespace(is_at_or_wake_command=False, get_message_str=lambda: "3nai5 猫")
+        self.assertFalse(gate.filter(event, None))
+        event.is_at_or_wake_command = True
+        self.assertTrue(gate.filter(event, None))
+        self.assertTrue(regex.filter(event, None))
+        for text in ("请3nai5 猫", "3nai51 猫", "3nai5extra 猫"):
+            event.get_message_str = lambda text=text: text
+            self.assertFalse(regex.filter(event, None))
 
     def test_command_filter_greedy_argument_excludes_command_name(self):
         params = CommandFilter("nai5").validate_and_convert_params(

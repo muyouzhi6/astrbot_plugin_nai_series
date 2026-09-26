@@ -56,11 +56,30 @@ class Store:
                 (job["id"], job["owner"], job["created"], json.dumps(job, ensure_ascii=False)),
             )
 
-    def jobs(self, owner=None, limit=None):
+    def save_jobs(self, jobs):
+        with self.connect() as db:
+            db.executemany(
+                "INSERT INTO jobs VALUES (?, ?, ?, ?)",
+                [
+                    (job["id"], job["owner"], job["created"], json.dumps(job, ensure_ascii=False))
+                    for job in jobs
+                ],
+            )
+
+    def claim(self, key):
+        with self.connect() as db:
+            result = db.execute("INSERT OR IGNORE INTO state VALUES (?, ?)", (key, "true"))
+            return result.rowcount == 1
+
+    def jobs(self, owner=None, limit=None, origin=None):
         query, args = "SELECT value FROM jobs", []
         if owner is not None:
             query += " WHERE owner=?"
             args.append(owner)
+        if origin is not None:
+            query += " AND " if owner is not None else " WHERE "
+            query += "json_extract(value, '$.origin')=?"
+            args.append(origin)
         query += " ORDER BY created DESC"
         if limit is not None:
             query += " LIMIT ?"
@@ -88,3 +107,7 @@ class Store:
             self.image_path(job["id"]).with_suffix(".tmp").unlink(missing_ok=True)
             with self.connect() as db:
                 db.execute("DELETE FROM jobs WHERE id=?", (job["id"],))
+                db.execute(
+                    "DELETE FROM state WHERE key=?",
+                    ("completion:" + (job.get("batch_id") or job["id"]),),
+                )

@@ -16,17 +16,43 @@ class NaiImageTool(FunctionTool):
 
 
 def make_tools(plugin):
+    max_count = max(1, min(8, int(plugin.config.get("batch_max_count", 4))))
     return [
         NaiImageTool(
             name=f"{family}_generate_image",
             family=family,
             plugin=plugin,
-            description=f"当用户明确要求用 {family} 生图时直接调用. 每次提交一张后台图片, 完成后自动发送, 用户可继续聊天. 调用前后不要输出提示、进度或完成说明. 保留用户原意, 不编造画师串或预设. 不确定预设时留空. 同一请求只提交一次, 无需轮询. nai4 指 4.5, nai5 指 5, 不得互换.",
+            description=(
+                f"仅当用户明确要求用 {family} 生图时调用. "
+                "NAI 的正向 prompt 应是英文 Danbooru 风格 tags 和必要的简短英文短语, 用英文逗号分隔, 不直接把整段中文照搬进 prompt. "
+                "先忠实理解用户描述, 再依次写出主体及数量、指定的外观/衣着、动作与对象关系、指定的场景和细节; "
+                "例如 '两只猫在窗边玩球' -> '2 cats, playing with a ball, by the window'. "
+                "数量、位置、否定与约束必须保留; 非标准标签可用简短英文短语表达, 不要硬造 tag. "
+                "用户已给出的英文 tags 原样保留. 不擅自补外观、镜头、质量词、画师串或负面词, "
+                "画师串和负面词由插件按模型预设处理. preset 只填明确指定的精确名称, 否则省略. "
+                f"count 按用户要求填写 1-{max_count}, 默认 1, 超过上限不可悄悄少画; "
+                "nai4 是 4.5, nai5 是 5, 不得互换. 图片在后台发送, 调用前不输出提示, "
+                "一次请求只调用一次, 不轮询."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string", "description": "用户原始画面描述, 保留数字和关系"},
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "忠实转换后的英文 NAI 正向 tags/短语, 英文逗号分隔. "
+                            "保留主体数量、动作及对象关系、衣着、位置、否定和用户明确细节; "
+                            "不要添写画师串、负面词或未要求的设定. "
+                            "例: 1girl, red dress, holding a book, sitting by the window"
+                        ),
+                    },
                     "preset": {"type": "string", "description": "可选预设精确名称, 不知道则留空"},
+                    "count": {
+                        "type": "integer",
+                        "description": "用户要求的图片张数, 默认为 1",
+                        "minimum": 1,
+                        "maximum": max_count,
+                    },
                 },
                 "required": ["prompt"],
                 "additionalProperties": False,
