@@ -178,6 +178,56 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         self.assertEqual(self.plugin.router.generate.await_count, 1)
 
+    async def test_fixed_tool_presets_ignore_session_and_model_arguments(self):
+        self.plugin.config.update(enable_llm_tool=True, llm_preset_nai4="A", llm_preset_nai5="B")
+        event = Event()
+        self.plugin._choose(event, "nai4", "none")
+        self.plugin._choose(event, "nai5", "none")
+        for family, expected in (("nai4", "style4"), ("nai5", "style5")):
+            await self.plugin.generate_as_tool(
+                event, family, {"prompt": "cat", "preset": "nonexistent preset"}
+            )
+            await self.finish()
+            request = self.plugin.router.generate.call_args.args[0]
+            self.assertEqual(request.prompt, f"{expected}, cat")
+            self.assertEqual(request.negative_prompt, "bad" + family[-1])
+        command = await self.execute(event, "nai5", "cat")
+        self.assertEqual(command["request"]["prompt"], "cat")
+
+    async def test_blank_fixed_preset_uses_model_default_not_session(self):
+        self.plugin.config.update(enable_llm_tool=True, llm_preset_nai5=" ")
+        event = Event()
+        self.plugin._choose(event, "nai5", "none")
+        await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat"})
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.call_args.args[0].prompt, "style5, cat")
+
+    async def test_fixed_none_disables_preset_even_with_session_choice(self):
+        self.plugin.config.update(enable_llm_tool=True, llm_preset_nai5="none")
+        event = Event()
+        self.plugin._choose(event, "nai5", "B")
+        await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat", "preset": "B"})
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.call_args.args[0].prompt, "cat")
+
+    async def test_invalid_fixed_preset_rejects_without_generation(self):
+        self.plugin.config.update(enable_llm_tool=True)
+        for name in ("missing", "A"):
+            self.plugin.config["llm_preset_nai5"] = name
+            event = Event()
+            await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat"})
+            self.assertIn("已不存在", event.get_extra("_nai_rejected"))
+        self.assertEqual(self.plugin.store.jobs(), [])
+        self.plugin.router.generate.assert_not_awaited()
+
+    async def test_ignored_preset_argument_does_not_bypass_deduplication(self):
+        self.plugin.config.update(enable_llm_tool=True, llm_preset_nai5="B")
+        event = Event()
+        for name in ("B", "wrong", ""):
+            await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat", "preset": name})
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.await_count, 1)
+
     async def test_llm_batch_count_and_same_turn_deduplication(self):
         self.plugin.config.update(enable_llm_tool=True, max_user_tasks=4)
         event = Event()
@@ -194,6 +244,7 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.config["batch_max_count"] = 4
         for tool in make_tools(self.plugin):
+            self.assertNotIn("preset", tool.parameters["properties"])
             self.assertIn("英文 Danbooru", tool.description)
             self.assertIn("数量、位置、否定", tool.description)
             self.assertIn("画师串和负面词由插件", tool.description)

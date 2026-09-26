@@ -2,7 +2,7 @@ name: astrbot_plugin_nai_series
 display_name: Nai系列生图
 desc: NAI 4.5 / NAI 5 图片生成, 模型专属画师预设与负面词, 忠实自然语言翻译, 预设展示和可选 LLM 生图工具.
 short_desc: 模型和预设分离的 Nai 系列生图插件.
-version: 1.2.2
+version: 1.2.4
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_nai_series
 tags:

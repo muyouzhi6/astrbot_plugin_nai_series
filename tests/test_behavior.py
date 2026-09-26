@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -23,9 +24,37 @@ try:
     from astrbot.core.star.filter.command import CommandFilter, GreedyStr
     from astrbot_plugin_nai_series.main import NaiSeriesPlugin
     from astrbot_plugin_nai_series.tools import make_tools
-    from astrbot_plugin_nai_series.translator import PromptTranslator
+    from astrbot_plugin_nai_series.translator import DEFAULT_TRANSLATOR_PROMPT, PromptTranslator
 except ImportError:
     NaiSeriesPlugin = None
+
+
+@unittest.skipIf(NaiSeriesPlugin is None, "AstrBot is not installed")
+class TranslatorConfigTests(unittest.TestCase):
+    def test_schema_default_matches_runtime_default(self):
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertTrue(DEFAULT_TRANSLATOR_PROMPT.strip())
+        self.assertEqual(schema["translator_system_prompt"]["default"], DEFAULT_TRANSLATOR_PROMPT)
+
+    def test_missing_or_blank_prompt_uses_default(self):
+        for config in ({}, {"translator_system_prompt": ""}, {"translator_system_prompt": "  "}):
+            with self.subTest(config=config):
+                self.assertEqual(PromptTranslator(config).system_prompt, DEFAULT_TRANSLATOR_PROMPT)
+
+    def test_custom_prompt_overrides_default(self):
+        translator = PromptTranslator({"translator_system_prompt": "Custom prompt"})
+        self.assertEqual(translator.system_prompt, "Custom prompt")
+
+    def test_prefix_is_preserved_with_default_and_custom_prompt(self):
+        for prompt in ("", "Custom prompt"):
+            with self.subTest(prompt=prompt):
+                translator = PromptTranslator(
+                    {"translator_system_prompt": prompt, "translator_custom_prefix": "Prefix"}
+                )
+                self.assertEqual(
+                    translator.system_prompt, f"Prefix\n\n{prompt or DEFAULT_TRANSLATOR_PROMPT}"
+                )
 
 
 def png():

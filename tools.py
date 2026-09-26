@@ -29,7 +29,7 @@ def make_tools(plugin):
                 "例如 '两只猫在窗边玩球' -> '2 cats, playing with a ball, by the window'. "
                 "数量、位置、否定与约束必须保留; 非标准标签可用简短英文短语表达, 不要硬造 tag. "
                 "用户已给出的英文 tags 原样保留. 不擅自补外观、镜头、质量词、画师串或负面词, "
-                "画师串和负面词由插件按模型预设处理. preset 只填明确指定的精确名称, 否则省略. "
+                "画师串和负面词由插件按配置面板固定的模型预设处理, 不要传入预设名或尝试切换预设. "
                 f"count 按用户要求填写 1-{max_count}, 默认 1, 超过上限不可悄悄少画; "
                 "nai4 是 4.5, nai5 是 5, 不得互换. 图片在后台发送, 调用前不输出提示, "
                 "一次请求只调用一次, 不轮询."
@@ -46,7 +46,6 @@ def make_tools(plugin):
                             "例: 1girl, red dress, holding a book, sitting by the window"
                         ),
                     },
-                    "preset": {"type": "string", "description": "可选预设精确名称, 不知道则留空"},
                     "count": {
                         "type": "integer",
                         "description": "用户要求的图片张数, 默认为 1",

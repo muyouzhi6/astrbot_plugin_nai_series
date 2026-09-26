@@ -219,6 +219,12 @@ class NaiSeriesPlugin(Star):
             raise ValueError(f"{family} 预设 {name} 已不存在, 请重新选择或 /预设 {family} none")
         return preset
 
+    def _llm_preset(self, family):
+        name = str(self.config.get(f"llm_preset_{family}", "")).strip()
+        if not name:
+            name = str(self.config.get(f"default_preset_{family}", "")).strip()
+        return name or "none"
+
     def _request(self, model, translated, preset, flags=None):
         flags = flags or {}
         family = model_family(model)
@@ -760,15 +766,17 @@ class NaiSeriesPlugin(Star):
             return None
         try:
             count = self._count(kwargs.get("count", 1))
-            signature = hashlib.sha256(repr((family, kwargs)).encode()).hexdigest()
+            prompt = str(kwargs.get("prompt", ""))
+            preset = self._llm_preset(family)
+            signature = hashlib.sha256(repr((family, prompt, count, preset)).encode()).hexdigest()
             submitted = event.get_extra("_nai_submitted", {})
             if signature in submitted:
                 return None
             task_id = self._submit(
                 event,
                 self._model(family),
-                str(kwargs.get("prompt", "")),
-                flags={"preset": kwargs["preset"]} if kwargs.get("preset") else {},
+                prompt,
+                flags={"preset": preset},
                 silent=True,
                 count=count,
                 completion=await self._completion_target(event),

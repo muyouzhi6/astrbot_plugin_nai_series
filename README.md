@@ -87,8 +87,10 @@ https://image.novelai.net
 
 `enable_llm_tool` 默认关闭. 开启并重载后注册两个独立工具:
 
-- `nai4_generate_image(prompt, count?, preset?)`
-- `nai5_generate_image(prompt, count?, preset?)`
+- `nai4_generate_image(prompt, count?)`
+- `nai5_generate_image(prompt, count?)`
+
+在配置面板的 `llm_preset_nai4` 和 `llm_preset_nai5` 分别设置聊天生图预设名称或 ID. 留空使用对应模型的默认预设, 填写 `none` 不使用预设. LLM 不选择预设, 聊天调用也不读取指令切换的会话预设; `/预设` 和 `--preset` 仍只控制指令生图. 配置的预设不存在或属于另一模型时拒绝提交, 不替换画风.
 
 工具仅在用户明确要求时调用, 保留原文, 不编造预设名, 不混用模型. 数量默认 1 张, 上限由 `batch_max_count` 控制. 调用立即提交后台任务并结束本轮工具回复, 不发送排队、翻译和生成中的提示. 图片单独发送到原会话; 若原对话仍有效, 整批完成后由 bot 按原人格自然接话一次. 切换会话后不会把旧图的完成回复带到新会话. 聊天调用失败不主动刷屏, 可用 `/nai任务` 查看状态和最近一次未提交原因. 关闭开关时不注册工具.
 
