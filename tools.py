@@ -23,7 +23,7 @@ def make_tools(plugin):
             family=family,
             plugin=plugin,
             description=(
-                f"仅当用户明确要求用 {family} 生图时调用. "
+                f"用户明确要求用 NAI 画图时调用. 当前配置模型为 {family}, 不需要用户提供模型名. "
                 "NAI 的正向 prompt 应是英文 Danbooru 风格 tags 和必要的简短英文短语, 用英文逗号分隔, 不直接把整段中文照搬进 prompt. "
                 "先忠实理解用户描述, 再依次写出主体及数量、指定的外观/衣着、动作与对象关系、指定的场景和细节; "
                 "例如 '两只猫在窗边玩球' -> '2 cats, playing with a ball, by the window'. "
@@ -57,5 +57,5 @@ def make_tools(plugin):
                 "additionalProperties": False,
             },
         )
-        for family in ("nai4", "nai5")
+        for family in (plugin._llm_family(),)
     ]

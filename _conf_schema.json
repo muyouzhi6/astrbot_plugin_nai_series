@@ -76,6 +76,7 @@
   "translator_custom_prefix": {"description": "翻译提示词前缀", "type": "string", "default": ""},
   "show_translated_prompt": {"description": "指令生图时显示翻译", "type": "bool", "default": false},
   "enable_llm_tool": {"description": "允许聊天调用生图", "type": "bool", "default": false},
+  "llm_model": {"description": "聊天生图模型", "type": "string", "options": ["nai4", "nai5"], "hint": "nai4 为 NAI 4.5, nai5 为 NAI 5. 仅影响聊天调用.", "default": "nai5"},
   "llm_preset_nai4": {"description": "NAI 4.5 聊天生图预设", "type": "string", "hint": "填写预设名称或 ID. 留空使用 NAI 4.5 默认预设, none 不使用预设.", "default": ""},
   "llm_preset_nai5": {"description": "NAI 5 聊天生图预设", "type": "string", "hint": "填写预设名称或 ID. 留空使用 NAI 5 默认预设, none 不使用预设.", "default": ""},
   "cfg_rescale_nai4": {"description": "NAI 4.5 CFG 重缩放", "type": "float", "default": 0},

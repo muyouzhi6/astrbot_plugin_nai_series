@@ -163,7 +163,7 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         outputs = [
             value
             async for value in FunctionToolExecutor.execute(
-                make_tools(self.plugin)[1], context, prompt="cat"
+                make_tools(self.plugin)[0], context, prompt="cat"
             )
         ]
         self.assertEqual(outputs, [None])
@@ -184,6 +184,7 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._choose(event, "nai4", "none")
         self.plugin._choose(event, "nai5", "none")
         for family, expected in (("nai4", "style4"), ("nai5", "style5")):
+            self.plugin.config["llm_model"] = family
             await self.plugin.generate_as_tool(
                 event, family, {"prompt": "cat", "preset": "nonexistent preset"}
             )
@@ -216,7 +217,8 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             self.plugin.config["llm_preset_nai5"] = name
             event = Event()
             await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat"})
-            self.assertIn("已不存在", event.get_extra("_nai_rejected"))
+            self.assertIn("不存在", event.get_extra("_nai_rejected"))
+            self.assertIn("可用预设: B", event.get_extra("_nai_rejected"))
         self.assertEqual(self.plugin.store.jobs(), [])
         self.plugin.router.generate.assert_not_awaited()
 
@@ -227,6 +229,46 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat", "preset": name})
         await self.finish()
         self.assertEqual(self.plugin.router.generate.await_count, 1)
+
+    async def test_rejection_is_visible_once_without_paid_request(self):
+        self.plugin.config.update(enable_llm_tool=True, llm_preset_nai5="missing")
+        event = Event()
+        for _ in range(2):
+            await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat"})
+        self.plugin.context.send_message.assert_awaited_once()
+        chain = self.plugin.context.send_message.call_args.args[1].chain
+        self.assertIn("聊天生图预设 missing 不存在", chain[0].text)
+        self.plugin.router.generate.assert_not_awaited()
+
+    async def test_selected_model_overrides_stale_tool_and_command_is_unchanged(self):
+        from astrbot_plugin_nai_series.tools import make_tools
+
+        self.plugin.config.update(
+            enable_llm_tool=True, llm_model="nai4", model_nai4="nai-diffusion-4-5-curated"
+        )
+        self.assertEqual([t.name for t in make_tools(self.plugin)], ["nai4_generate_image"])
+        event = Event()
+        await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat", "model": "nai5"})
+        await self.finish()
+        request = self.plugin.router.generate.call_args.args[0]
+        self.assertEqual(request.model, "nai-diffusion-4-5-curated")
+        self.assertEqual(request.prompt, "style4, cat")
+        self.assertEqual(request.negative_prompt, "bad4")
+        job = await self.execute(event, self.plugin._model("nai5"), "cat")
+        self.assertEqual(job["request"]["model"], "nai-diffusion-5-full")
+
+    def test_model_switch_exposes_only_selected_tool(self):
+        from astrbot_plugin_nai_series.tools import make_tools
+
+        for family in ("nai4", "nai5"):
+            self.plugin.config["llm_model"] = family
+            tools = make_tools(self.plugin)
+            self.assertEqual([t.name for t in tools], [family + "_generate_image"])
+            self.assertNotIn("model", tools[0].parameters["properties"])
+            self.assertNotIn("preset", tools[0].parameters["properties"])
+        self.plugin.config["llm_model"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "聊天生图模型"):
+            make_tools(self.plugin)
 
     async def test_llm_batch_count_and_same_turn_deduplication(self):
         self.plugin.config.update(enable_llm_tool=True, max_user_tasks=4)

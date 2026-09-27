@@ -53,10 +53,22 @@ class NaiSeriesPlugin(Star):
             if isinstance(preset, dict) and not preset.get("id"):
                 preset["id"] = uuid.uuid4().hex
                 changed = True
+        for family in ("nai4", "nai5"):
+            key = f"llm_preset_{family}"
+            name = str(config.get(key, "")).strip()
+            if name and name not in ("none", "无"):
+                preset = find_preset(self._load_presets(), name, family)
+                if preset and config[key] != preset.id:
+                    config[key] = preset.id
+                    changed = True
         if changed and callable(getattr(config, "save_config", None)):
             config.save_config()
         self._load_presets()
         if config.get("enable_llm_tool", False):
+            try:
+                self._llm_preset(self._llm_family())
+            except ValueError as exc:
+                logger.warning("[NaiSeries] %s", exc)
             tools = make_tools(self)
             self.context.add_llm_tools(*tools)
             self._tool_names = [tool.name for tool in tools]
@@ -102,7 +114,8 @@ class NaiSeriesPlugin(Star):
             return
         req.system_prompt = (
             (req.system_prompt or "")
-            + "\n调用 nai4_generate_image 或 nai5_generate_image 时直接调用工具, 不输出开场白或进度; 图片完成后会在原会话自然接话."
+            + f"\n用户要求 NAI 生图时直接调用 {self._llm_family()}_generate_image, "
+            "模型和预设由管理员配置决定, 不自行切换. 不输出开场白或进度; 图片完成后会在原会话自然接话."
         )
         if event.get_extra("_nai_send_guard"):
             return
@@ -219,11 +232,27 @@ class NaiSeriesPlugin(Star):
             raise ValueError(f"{family} 预设 {name} 已不存在, 请重新选择或 /预设 {family} none")
         return preset
 
+    def _llm_family(self):
+        family = str(self.config.get("llm_model", "nai5")).strip()
+        if family not in ("nai4", "nai5"):
+            raise ValueError("聊天生图模型必须选择 nai4 或 nai5")
+        return family
+
     def _llm_preset(self, family):
         name = str(self.config.get(f"llm_preset_{family}", "")).strip()
         if not name:
             name = str(self.config.get(f"default_preset_{family}", "")).strip()
-        return name or "none"
+        if name in ("", "none", "无"):
+            return "none"
+        presets = self._load_presets()
+        preset = find_preset(presets, name, family)
+        if preset is None:
+            available = ", ".join(p.name for p in presets if p.family == family)[:200] or "无"
+            raise ValueError(
+                f"{family} 聊天生图预设 {name[:80]} 不存在. 请在插件配置中重新选择. "
+                f"可用预设: {available}"
+            )
+        return preset.id
 
     def _request(self, model, translated, preset, flags=None):
         flags = flags or {}
@@ -691,6 +720,8 @@ class NaiSeriesPlugin(Star):
             yield event.plain_result(
                 "\n\n".join(rows)
                 + f"\n处理中: {self.pending}\nLLM 工具: {'开' if self._tool_names else '关'}"
+                + f"\n聊天生图模型: {self._model(self._llm_family())}"
+                + f"\n聊天生图预设: {self._llm_preset(self._llm_family())}"
             )
         except ValueError as exc:
             yield event.plain_result(str(exc))
@@ -765,6 +796,7 @@ class NaiSeriesPlugin(Star):
         if not self.config.get("enable_llm_tool", False):
             return None
         try:
+            family = self._llm_family()
             count = self._count(kwargs.get("count", 1))
             prompt = str(kwargs.get("prompt", ""))
             preset = self._llm_preset(family)
@@ -788,7 +820,13 @@ class NaiSeriesPlugin(Star):
         except (ValueError, GenerationError) as exc:
             event.set_extra("_nai_rejected", str(exc))
             self.store.put("rejected:" + self._key(event), str(exc))
-            logger.info("[NaiSeries] tool rejected: %s", type(exc).__name__)
+            logger.warning("[NaiSeries] tool rejected: %s", exc)
+            if not event.get_extra("_nai_rejection_sent", False):
+                event.set_extra("_nai_rejection_sent", True)
+                try:
+                    await self._send(event.unified_msg_origin, [Plain(f"这次没能开始画: {exc}")])
+                except Exception:
+                    logger.warning("[NaiSeries] rejection notification failed")
         except Exception:
             logger.warning("[NaiSeries] tool submission failed")
         # AstrBot treats None as a direct-result tool and ends the agent loop.
