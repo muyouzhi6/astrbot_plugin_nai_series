@@ -64,8 +64,8 @@ NAI SYNTAX RULES
    f) pose, action, sex act, expression
    g) framing: cowboy shot, full body, from below, looking at viewer
    h) background, location, lighting, time
-   i) style / medium if requested
-   j) quality at the END (do not overdo): masterpiece, best quality, very aesthetic, absurdres
+   i) style / medium: anime style, illustration, digital art, painting style, soft lighting, cinematic lighting (DO NOT add artist names like wlop, greg rutkowski, artgerm — those are handled by preset)
+   j) quality at the END: masterpiece, best quality, very aesthetic, absurdres, amazing quality
 8. For NSFW, put the sex-critical tags early-middle, not buried at the end.
 9. Multi-character interaction on V4.5:
    In base POSITIVE keep shared scene tags.
@@ -73,11 +73,13 @@ NAI SYNTAX RULES
    For who-does-what, use source# / target# on the action tag when helpful, e.g. source#fellatio , target#fellatio
 10. Keep prompts compact. Typical good length: 30–80 tags. Cut redundancy.
 11. English tags only in POSITIVE/UNDESIRED/CHAR. Never output Chinese tags.
-12. If user specifies artist / year / official style, include those tags near the front after count tags.
+12. Always include camera angles (cowboy shot, from below, full body), lighting (soft lighting, cinematic lighting, sunlight), general style keywords (anime style, illustration, digital art), and quality tags (masterpiece, best quality, very aesthetic, absurdres). DO NOT add specific artist names — the system adds those automatically from the preset.
 
 QUALITY AND UC
-- POSITIVE quality default (append at end unless user forbids): masterpiece, best quality, very aesthetic, absurdres
+- POSITIVE quality default (append at end): masterpiece, best quality, very aesthetic, absurdres
 - For explicit NSFW, "amazing quality" is acceptable instead of or with best quality.
+- Always include general style keywords: anime style, illustration, digital art, soft lighting, cinematic lighting
+- DO NOT include artist names (wlop, greg rutkowski, artgerm, trending on artstation, etc.) — those are added automatically by the preset
 - UNDESIRED must NEVER include: nsfw, explicit, nude, pussy, penis, sex
   (Official NAI Heavy UC includes "nsfw" and will suppress erotica. Do not copy that.)
 - Default UNDESIRED for NSFW:
@@ -140,6 +142,7 @@ RATING
 
 INFERENCE RULES
 - Infer missing but necessary visual details (hair color, shot type) only when needed for a coherent image. Mark invented details minimally; do not overwrite user specs.
+- Always add camera angles (cowboy shot, from below, full body), lighting (soft lighting, cinematic lighting, sunlight), general style (anime style, illustration, digital art), and quality tags (masterpiece, best quality, very aesthetic, absurdres) to improve output.
 - If clothing and nude state conflict, follow the more explicit sexual intent.
 - If user already pasted tags, clean them: underscores→spaces, A1111 weights→NAI weights, dedupe, reorder.
 - Preserve user's important specifics: hair, eyes, outfit pieces, exact act, camera, location.
@@ -156,19 +159,25 @@ EXAMPLES
 
 User: 一个短发绿眼的成年女人在卧室里全裸对着镜头坐着，双腿张开，能看到小穴
 POSITIVE:
-1girl, solo, adult, woman, nsfw, explicit, rating:explicit, uncensored, short hair, green eyes, completely nude, nipples, pussy, sitting, on bed, spread legs, looking at viewer, cowboy shot, bedroom, indoors, location, masterpiece, best quality, very aesthetic, absurdres
+1girl, solo, adult, woman, nsfw, explicit, rating:explicit, uncensored, short hair, green eyes, completely nude, nipples, pussy, sitting, on bed, spread legs, looking at viewer, cowboy shot, bedroom, indoors, location, soft lighting, anime style, masterpiece, best quality, very aesthetic, absurdres
 UNDESIRED:
 lowres, blurry, upscaled, artistic error, scan artifacts, jpeg artifacts, worst quality, bad quality, very displeasing, extra fingers, bad hands, bad anatomy, censored, bar censor, mosaic censoring, child, loli, watermark, text
 
 User: 金发红瞳女大学生给男人口交，侧面，精液挂在嘴唇上
 POSITIVE:
-1girl, 1boy, adult, nsfw, explicit, rating:explicit, uncensored, blonde hair, red eyes, oral, fellatio, penis, erection, cum on lips, saliva, on knees, profile, bedroom, indoors, masterpiece, best quality, very aesthetic, absurdres
+1girl, 1boy, adult, nsfw, explicit, rating:explicit, uncensored, blonde hair, red eyes, oral, fellatio, penis, erection, cum on lips, saliva, on knees, profile, bedroom, indoors, cinematic lighting, anime style, masterpiece, best quality, very aesthetic, absurdres
 UNDESIRED:
 lowres, blurry, upscaled, artistic error, jpeg artifacts, worst quality, bad quality, extra fingers, bad hands, bad anatomy, censored, mosaic censoring, child, loli, shota, watermark, text
 CHAR1:
 girl, blonde hair, red eyes, on knees, oral, fellatio, source#fellatio
 CHAR2:
-boy, penis, erection, standing, target#fellatio"""
+boy, penis, erection, standing, target#fellatio
+
+User: 两只可爱的橘猫在窗边玩毛线球
+POSITIVE:
+2 cats, orange tabby, cute, fluffy, playing with yarn ball, by the window, sunlight, cozy atmosphere, soft lighting, digital art, masterpiece, best quality, very aesthetic, absurdres
+UNDESIRED:
+lowres, blurry, jpeg artifacts, worst quality, bad quality, watermark, text"""
 
 
 def has_chinese(text: str) -> bool:
