@@ -10,7 +10,17 @@
 4. 在可视化预设列表中分别添加 NAI 4.5 和 NAI 5 预设, 填写预设名称、画师串、负面词. 将对应名称填入两套默认预设.
 5. 发送 `/nai4 描述` 或 `/nai5 描述`.
 
-支持配置多个连接. 根据地址自动识别 OpenAI Images 和官方图片协议. 当前版本只在接口明确拒绝认证、权限或路由不存在时尝试下一连接; 超时、服务器错误和下载失败不会自动重新提交付费任务.
+支持配置多个连接. 根据地址自动识别 OpenAI Images 和官方图片协议. 接口明确拒绝认证、权限或路由不存在时尝试下一连接; 超时、服务器错误和下载失败不会自动重新提交付费任务.
+
+### 非流式请求（1.4.0）
+
+`use_stream` 是布尔配置，默认 `false`，保持原有非流式行为；旧配置缺少此字段时也按 `false` 处理。中转站不支持 SSE 或流式不稳定时，在插件配置中关闭“中转接口使用流式请求”，保存并重载插件。
+
+- 关闭：所有 OpenAI 兼容图片连接和翻译接口发送 `stream:false`，一次性接收结果，不要求 SSE。
+- 开启：上述接口发送 `stream:true`；图片和翻译结果都在完整接收后处理。
+- 两种设置均支持 Images 的 `data[].b64_json`、`data[].url`，以及 Chat 返回的 Markdown 图片链接、图片 data URI、多段 content 数组。接口仍返回 SSE 时自动解析，包括拆分的图片链接和 Base64 文本。
+- 指令、聊天工具、批量生成、预设试画、重绘及图生图共用同一图片请求设置。参考图和结果图片下载是普通 HTTP GET；官方 NovelAI 使用原有图片协议。AstrBot 聊天主模型与生图完成后的继续对话使用 AstrBot 的流式配置。
+- HTTP 错误、未返回图片、无法识别的格式和 URL 下载失败分别提示，错误信息不包含密钥或完整响应。下载失败不会重新生成。
 
 常见地址:
 
@@ -131,12 +141,12 @@ Images 请求不自动传 seed, 避免部分中转把字符串随机种子改成
 ## 开发与测试
 
 ```bash
-uv venv --python 3.12
-uv pip install -r requirements.txt ruff
-.venv/bin/python -m unittest discover -s tests -v
+uv venv .venv --python 3.12
+uv pip install --python .venv/bin/python -r requirements.txt pytest ruff 'astrbot>=4.28.1,<5'
+.venv/bin/python -m pytest -q
 .venv/bin/ruff check .
 ```
 
-在包含 AstrBot 依赖的 Python 环境中运行同一测试命令, 会额外执行命令、工具和发送集成测试; 普通环境明确跳过这些集成测试.
+全套测试使用真实 AstrBot 依赖，包含命令、工具、发送与 agent 集成测试。中转协议测试使用 aiohttp 本地 mock 服务，覆盖流式开关、JSON/SSE、图片下载与错误分支。
 
 参考 AstrBot 官方插件文档、BestNAI 工作流、gitee 生图的后台任务流程及 lifeschedule 的衣柜展示交互. 本插件独立实现.

@@ -498,7 +498,11 @@ class NaiSeriesPlugin(Star):
                         raise GenerationError("参考图已失效, 未提交生成") from None
                 queue.transition(job, "translating")
                 prompt = job["original_prompt"]
-                translated = prompt if job["raw"] else await self.translator.translate(prompt)
+                try:
+                    translated = prompt if job["raw"] else await self.translator.translate(prompt)
+                except ValueError as exc:
+                    # Translator errors contain a local summary, never an upstream body.
+                    raise GenerationError(str(exc)) from None
                 draft = GenerationRequest(**job["request"])
                 request = (
                     draft
@@ -552,7 +556,11 @@ class NaiSeriesPlugin(Star):
         except Exception as exc:
             if isinstance(exc, GenerationError):
                 queue.transition(
-                    job, job["state"], http_status=exc.status, request_id=exc.request_id
+                    job,
+                    job["state"],
+                    http_status=exc.status,
+                    request_id=exc.request_id,
+                    generation_error=exc.message,
                 )
                 logger.warning(
                     "[NaiSeries] task=%s status=%s request_id=%s",
@@ -566,7 +574,14 @@ class NaiSeriesPlugin(Star):
             if not job["silent"]:
                 try:
                     await self._send(
-                        job["umo"], [Plain(f"任务 {job['id']} 未完成, 用 /nai任务 查看状态.")]
+                        job["umo"],
+                        [
+                            Plain(
+                                f"任务 {job['id']} 未完成"
+                                + (f": {exc.message}" if isinstance(exc, GenerationError) else "")
+                                + ", 用 /nai任务 查看状态."
+                            )
+                        ],
                     )
                 except Exception:
                     pass
@@ -841,6 +856,7 @@ class NaiSeriesPlugin(Star):
                 f"{j['id']} | {j['request']['model']} | {LABELS.get(j['state'], j['state'])}"
                 + (f" | HTTP {j['http_status']}" if j.get("http_status") else "")
                 + (f" | 请求编号 {j['request_id']}" if j.get("request_id") else "")
+                + (f" | {j['generation_error']}" if j.get("generation_error") else "")
                 for j in jobs
             )
             + (f"\n上次未提交: {rejected}" if rejected else "")

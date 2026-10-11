@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 
 import aiohttp
 from astrbot.api import logger
+
+from .providers import GenerationError, chat_content_parts, openai_response_objects, read_limited
 
 DEFAULT_TRANSLATOR_PROMPT = r"""You are NAI-Prompt-Compiler, a professional NovelAI Diffusion (V4 / V4.5 Full) prompt compiler.
 
@@ -197,6 +198,35 @@ class PromptTranslator:
         prefix = str(config.get("translator_custom_prefix", "")).strip()
         self.system_prompt = f"{prefix}\n\n{self.system_prompt}" if prefix else self.system_prompt
         self.timeout = int(config.get("translator_timeout", 45))
+        self.use_stream = bool(config.get("use_stream", False))
+
+    @staticmethod
+    def _parse_response(body: bytes, content_type: str) -> str:
+        parts = []
+        recognized = False
+        for data in openai_response_objects(body, content_type):
+            if data.get("error"):
+                raise GenerationError("翻译接口返回上游错误")
+            choices = data.get("choices")
+            if not isinstance(choices, list):
+                raise GenerationError("翻译返回格式无法识别: choices 应为数组")
+            recognized = True
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise GenerationError("翻译返回格式无法识别: choices 条目无效")
+                if choice.get("index", 0) != 0:
+                    continue
+                if choice.get("finish_reason") not in (None, "stop"):
+                    raise GenerationError("翻译文本未完整返回")
+                message = choice.get("message", choice.get("delta", {}))
+                if not isinstance(message, dict):
+                    raise GenerationError("翻译返回格式无法识别: message 应为对象")
+                text, _ = chat_content_parts(message.get("content"))
+                parts.append(text)
+        content = "".join(parts).strip()
+        if not recognized or not content:
+            raise GenerationError("翻译接口返回里没有文本")
+        return content.replace("\n", ", ")
 
     async def translate(self, text: str) -> str:
         if not self.enabled or not has_chinese(text):
@@ -216,7 +246,7 @@ class PromptTranslator:
             ],
             "temperature": 0.1,
             "max_tokens": 1500,
-            "stream": False,
+            "stream": self.use_stream,
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
@@ -224,32 +254,18 @@ class PromptTranslator:
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
-                    body = await response.text()
+                    body = await read_limited(response, 2 * 1024 * 1024)
                     if response.status != 200:
-                        raise RuntimeError(f"translator HTTP {response.status}")
-                    data = json.loads(body)
-                    if not isinstance(data, dict) or not data.get("choices"):
-                        raise RuntimeError("translator returned no choices")
-                    choice = data["choices"][0]
-                    if choice.get("finish_reason") not in (None, "stop"):
-                        raise RuntimeError("translator did not finish normally")
-                    message = choice.get("message", {})
-                    content = message.get("content")
-                    if not isinstance(content, str) or not content.strip():
-                        raise RuntimeError(
-                            f"translator returned no text: {data.get('choices', [{}])[0].get('finish_reason')}"
-                        )
-                    return content.strip().replace("\n", ", ")
-        except (
-            asyncio.TimeoutError,
-            aiohttp.ClientError,
-            json.JSONDecodeError,
-            RuntimeError,
-            TypeError,
-            AttributeError,
-            IndexError,
-        ) as exc:
-            logger.warning("[NaiSeries] 翻译失败 (%s)", type(exc).__name__)
-            raise ValueError(
-                "翻译未返回有效文本, 未发起付费生图. 请检查翻译模型或使用 --raw"
-            ) from exc
+                        raise GenerationError(f"翻译接口 HTTP {response.status}")
+                    return self._parse_response(body, response.headers.get("content-type", ""))
+        except asyncio.TimeoutError as exc:
+            reason = "翻译请求超时"
+            error = exc
+        except aiohttp.ClientError as exc:
+            reason = "翻译网络请求失败"
+            error = exc
+        except GenerationError as exc:
+            reason = exc.message
+            error = exc
+        logger.warning("[NaiSeries] 翻译失败 (%s)", type(error).__name__)
+        raise ValueError(f"{reason}; 未发起付费生图, 请检查翻译模型或使用 --raw") from None

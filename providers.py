@@ -99,13 +99,18 @@ async def download_image(url, timeout):
         address = None
     if address and not address.is_global:
         raise GenerationError("图片下载地址不得指向内网")
-    async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(resolver=PublicResolver()), timeout=timeout
-    ) as session:
-        async with session.get(url, allow_redirects=False) as response:
-            if response.status != 200:
-                raise GenerationError("图片已经生成但下载失败, 没有自动重新生成")
-            return await read_limited(response, 24 * 1024 * 1024)
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(resolver=PublicResolver()), timeout=timeout
+        ) as session:
+            async with session.get(url, allow_redirects=False) as response:
+                if response.status != 200:
+                    raise GenerationError(f"图片 URL 下载失败: HTTP {response.status}; 未重新生成")
+                return await read_limited(response, 24 * 1024 * 1024)
+    except asyncio.TimeoutError as exc:
+        raise GenerationError("图片 URL 下载超时; 未重新生成") from exc
+    except aiohttp.ClientError as exc:
+        raise GenerationError("图片 URL 下载失败: 网络连接错误; 未重新生成") from exc
 
 
 def _validate_image(data: bytes) -> None:
@@ -120,12 +125,172 @@ def _validate_image(data: bytes) -> None:
         raise GenerationError("服务商返回的内容不是有效图片") from exc
 
 
+def openai_response_objects(body: bytes, content_type: str = "") -> list[dict]:
+    """Decode JSON or SSE independently of the requested transport mode."""
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise GenerationError("接口返回格式无法识别") from exc
+    is_sse = "event-stream" in content_type.lower() or text.lstrip().startswith(
+        ("data:", "event:", ":")
+    )
+    if not is_sse:
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise GenerationError("接口返回格式无法识别: 不是有效 JSON 或 SSE") from exc
+        if not isinstance(data, dict):
+            raise GenerationError("接口返回格式无法识别: JSON 应为对象")
+        return [data]
+
+    events = []
+    fields = []
+
+    def flush():
+        if not fields:
+            return
+        payload = "\n".join(fields).strip()
+        fields.clear()
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            data = json.loads(payload)
+        except ValueError as exc:
+            raise GenerationError("接口 SSE 返回格式无法识别: 事件不是有效 JSON") from exc
+        if not isinstance(data, dict):
+            raise GenerationError("接口 SSE 返回格式无法识别: 事件应为对象")
+        events.append(data)
+
+    for line in text.splitlines():
+        if not line.strip():
+            flush()
+        elif line.startswith("data:"):
+            fields.append(line[5:].lstrip(" "))
+    flush()
+    if not events:
+        raise GenerationError("接口 SSE 返回里没有内容")
+    return events
+
+
+def chat_content_parts(content: Any) -> tuple[str, list[str]]:
+    """Return text and explicit image URLs from chat multimodal content."""
+    if content is None:
+        return "", []
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        raise GenerationError("接口返回格式无法识别: content 应为文本或数组")
+    text, urls = [], []
+    for part in content:
+        if isinstance(part, str):
+            text.append(part)
+        elif isinstance(part, dict):
+            if isinstance(part.get("text"), str):
+                text.append(part["text"])
+            image_url = part.get("image_url", part.get("url"))
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            if isinstance(image_url, str) and image_url:
+                urls.append(image_url)
+        else:
+            raise GenerationError("接口返回格式无法识别: content 数组条目无效")
+    return "".join(text), urls
+
+
 class OpenAIImagesProvider:
-    def __init__(self, name: str, base_url: str, api_key: str, timeout: int = 300):
+    def __init__(
+        self, name: str, base_url: str, api_key: str, timeout: int = 300, use_stream: bool = False
+    ):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.use_stream = use_stream
+
+    async def _parse_image_value(
+        self, value: str, timeout: aiohttp.ClientTimeout
+    ) -> GeneratedImage:
+        if not isinstance(value, str) or not value.strip():
+            raise GenerationError("图片返回格式无法识别: 图片字段应为非空文本")
+        value = value.strip()
+        if value.startswith("data:"):
+            match = re.fullmatch(r"data:image/[\w.+-]+;base64,([A-Za-z0-9+/=]+)", value)
+            if not match:
+                raise GenerationError("图片 data URI 格式无法识别")
+            value = match[1]
+        if value.startswith(("http://", "https://")):
+            try:
+                raw = await download_image(value, timeout)
+            except GenerationError as exc:
+                raise GenerationError(f"图片 URL 下载失败: {exc.message}") from exc
+            except (ValueError, TypeError) as exc:
+                raise GenerationError("图片 URL 下载失败: 地址格式无效") from exc
+        else:
+            try:
+                raw = base64.b64decode(value, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise GenerationError("图片 Base64 格式无法识别") from exc
+        await asyncio.to_thread(_validate_image, raw)
+        return GeneratedImage(raw)
+
+    async def _parse_response(
+        self, body: bytes, content_type: str, timeout: aiohttp.ClientTimeout
+    ) -> list[GeneratedImage]:
+        values = []
+        texts: dict[int, list[str]] = {}
+        recognized = False
+        for data in openai_response_objects(body, content_type):
+            if data.get("error") or data.get("event_type") == "error":
+                raise GenerationError("图片接口返回上游错误; 未自动重新生成")
+            if "data" in data:
+                recognized = True
+                if not isinstance(data["data"], list):
+                    raise GenerationError("图片返回格式无法识别: data 应为数组")
+                for item in data["data"]:
+                    if not isinstance(item, dict):
+                        raise GenerationError("图片返回格式无法识别: data 数组条目无效")
+                    value = item.get("b64_json") or item.get("url")
+                    if value:
+                        values.append(value)
+            # Some relays expose NovelAI final-image events directly.
+            if "image" in data:
+                recognized = True
+                if data.get("final") is not False and data.get("event_type") != "intermediate":
+                    values.append(data["image"])
+            if "choices" in data:
+                recognized = True
+                if not isinstance(data["choices"], list):
+                    raise GenerationError("图片返回格式无法识别: choices 应为数组")
+                for choice in data["choices"]:
+                    if not isinstance(choice, dict):
+                        raise GenerationError("图片返回格式无法识别: choices 数组条目无效")
+                    message = choice.get("message", choice.get("delta", {}))
+                    if not isinstance(message, dict):
+                        raise GenerationError("图片返回格式无法识别: message 应为对象")
+                    text, urls = chat_content_parts(message.get("content"))
+                    index = choice.get("index", 0)
+                    if type(index) is not int:
+                        raise GenerationError("图片返回格式无法识别: choice 编号无效")
+                    texts.setdefault(index, []).append(text)
+                    values.extend(urls)
+        for parts in texts.values():
+            text = "".join(parts)
+            # Collect in document order; data URIs inside markdown are decoded once.
+            pattern = (
+                r"!\[[^\]]*\]\(\s*<?((?:https?://|data:image/)[^\s<>]+?)>?"
+                r'(?:\s+"[^"\n]*")?\s*\)'
+                r"|(data:image/[\w.+-]+;base64,[A-Za-z0-9+/=]+)"
+            )
+            for match in re.finditer(pattern, text):
+                values.append(match[1] or match[2])
+        if not recognized:
+            raise GenerationError("图片接口返回格式无法识别")
+        if not values:
+            raise GenerationError("图片接口返回里没有图片")
+        images = []
+        for value in values:
+            images.append(await self._parse_image_value(value, timeout))
+        return images
 
     async def generate(self, request: GenerationRequest) -> list[GeneratedImage]:
         base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
@@ -143,6 +308,7 @@ class OpenAIImagesProvider:
             "noise_schedule": request.noise_schedule,
             "cfg_rescale": request.cfg_rescale,
         }
+        payload["stream"] = self.use_stream
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         if request.action == "img2img":
             payload.update(action=request.action, **image_parameters(request))
@@ -153,28 +319,9 @@ class OpenAIImagesProvider:
                     body = await read_limited(response)
                     if response.status != 200:
                         raise response_error(response, body)
-                    try:
-                        data = json.loads(body)
-                    except json.JSONDecodeError as exc:
-                        raise GenerationError(f"{self.name} 返回了无效 JSON") from exc
-                    images: list[GeneratedImage] = []
-                    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
-                        raise GenerationError("图片接口响应格式无效")
-                    for item in data.get("data", []):
-                        encoded = item.get("b64_json") if isinstance(item, dict) else None
-                        if encoded:
-                            raw = base64.b64decode(encoded, validate=True)
-                            await asyncio.to_thread(_validate_image, raw)
-                            images.append(GeneratedImage(raw))
-                            continue
-                        image_url = item.get("url") if isinstance(item, dict) else None
-                        if image_url:
-                            raw = await download_image(image_url, timeout)
-                            await asyncio.to_thread(_validate_image, raw)
-                            images.append(GeneratedImage(raw))
-                    if not images:
-                        raise GenerationError(f"{self.name} 没有返回图片")
-                    return images
+                    return await self._parse_response(
+                        body, response.headers.get("content-type", "").lower(), timeout
+                    )
             except asyncio.TimeoutError as exc:
                 raise GenerationError(f"{self.name} 图片请求超时") from exc
             except aiohttp.ClientError as exc:
@@ -341,7 +488,11 @@ class ProviderRouter:
                         )
                     )
                 else:
-                    self.providers.append(OpenAIImagesProvider(name, url, api_key, timeout))
+                    self.providers.append(
+                        OpenAIImagesProvider(
+                            name, url, api_key, timeout, bool(config.get("use_stream", False))
+                        )
+                    )
 
     async def generate(self, request: GenerationRequest) -> tuple[list[GeneratedImage], str]:
         if not self.providers:

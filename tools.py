@@ -32,7 +32,7 @@ def make_tools(plugin):
                 "例如 '两只猫在窗边玩球' -> '2 cats, playing with a ball, by the window'. "
                 "数量、位置、否定与约束必须保留; 非标准标签可用简短英文短语表达, 不要硬造 tag. "
                 "用户已给出的英文 tags 原样保留. 画师名由插件配置的预设自动添加, 不要在 prompt 中写入画师名 (如 wlop, artgerm 等人名). "
-                "负面词由预设处理, 不传入. 但可以添加镜头角度、光照、通用画风描述 (如 anime style, illustration, soft lighting, cinematic lighting) 和质量词 (masterpiece, best quality, very aesthetic, absurdres). "
+                "画师串和负面词由插件配置的预设自动处理, 不传入. 但可以添加镜头角度、光照、通用画风描述 (如 anime style, illustration, soft lighting, cinematic lighting) 和质量词 (masterpiece, best quality, very aesthetic, absurdres). "
                 f"count 按用户要求填写 1-{max_count}, 默认 1, 超过上限不可悄悄少画; "
                 "nai4 是 4.5, nai5 是 5, 不得互换. 图片在后台发送, 调用前不输出提示, "
                 "一次请求只调用一次, 不轮询."
