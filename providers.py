@@ -7,6 +7,7 @@ import base64
 import io
 import ipaddress
 import json
+import re
 import secrets
 import zipfile
 from dataclasses import dataclass
@@ -20,10 +21,44 @@ from .models import GenerationRequest
 
 
 class GenerationError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None, request_id: str = ""):
         super().__init__(message)
         self.message = message
         self.status = status
+        self.request_id = request_id
+
+
+def response_error(response, body=b""):
+    # Only persist a validated correlation ID, never an untrusted error body.
+    request_id = response.headers.get("X-Request-Id", "") or response.headers.get(
+        "X-Oneapi-Request-Id", ""
+    )
+    upstream = ""
+    try:
+        error = json.loads(body).get("error", {})
+        if isinstance(error, dict):
+            request_id = request_id or str(error.get("request_id", ""))
+            match = re.fullmatch(
+                r"NAI upstream HTTP ([1-5][0-9]{2}); not retried", str(error.get("message", ""))
+            )
+            if match:
+                upstream = f", 上游 HTTP {match[1]}"
+    except (ValueError, AttributeError):
+        pass
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", request_id):
+        request_id = ""
+    message = f"图片接口 HTTP {response.status}" + upstream
+    if request_id:
+        message += f", 请求编号 {request_id}"
+    return GenerationError(message + "; 未自动重试", response.status, request_id)
+
+
+def image_parameters(request):
+    if request.action != "img2img":
+        return {}
+    if not request.image:
+        raise GenerationError("参考图未就绪, 未提交生成")
+    return {"image": request.image, "strength": request.strength, "noise": request.noise}
 
 
 @dataclass(frozen=True)
@@ -109,16 +144,15 @@ class OpenAIImagesProvider:
             "cfg_rescale": request.cfg_rescale,
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if request.action == "img2img":
+            payload.update(action=request.action, **image_parameters(request))
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload, headers=headers) as response:
                     body = await read_limited(response)
                     if response.status != 200:
-                        raise GenerationError(
-                            f"图片接口 HTTP {response.status}, 请检查模型权限/配额和连接配置",
-                            response.status,
-                        )
+                        raise response_error(response, body)
                     try:
                         data = json.loads(body)
                     except json.JSONDecodeError as exc:
@@ -161,7 +195,7 @@ class OfficialNovelAIProvider:
         payload = {
             "input": request.prompt,
             "model": request.model,
-            "action": "generate",
+            "action": request.action,
             "parameters": {
                 "width": request.width,
                 "height": request.height,
@@ -187,6 +221,7 @@ class OfficialNovelAIProvider:
                 },
             },
         }
+        payload["parameters"].update(image_parameters(request))
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -194,10 +229,7 @@ class OfficialNovelAIProvider:
                 async with session.post(url, json=payload, headers=headers) as response:
                     body = await read_limited(response)
                     if response.status not in (200, 201):
-                        raise GenerationError(
-                            f"图片接口 HTTP {response.status}, 请检查模型权限/配额和连接配置",
-                            response.status,
-                        )
+                        raise response_error(response, body)
                     content_type = response.headers.get("content-type", "").lower()
                     if "json" in content_type or body.lstrip().startswith(b"{"):
                         return self._parse_json_image(body)

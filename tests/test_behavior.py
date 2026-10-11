@@ -346,7 +346,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.config["enable_llm_tool"] = True
         tools = make_tools(self.plugin)
-        self.assertEqual([t.name for t in tools], ["nai5_generate_image"])
+        self.assertEqual([t.name for t in tools], ["nai5_generate_image", "nai5_edit_image"])
         context = SimpleNamespace(context=SimpleNamespace(event=Event()))
         result = await tools[0].call(context, prompt="cat", preset="B")
         self.assertIsNone(result)
@@ -364,7 +364,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 return_value=Path(self.directory.name),
             ):
                 plugin = NaiSeriesPlugin(context, config)
-            self.assertEqual(len(plugin._tool_names), 1 if enabled else 0)
+            self.assertEqual(len(plugin._tool_names), 2 if enabled else 0)
             self.assertEqual(context.add_llm_tools.call_count, 1 if enabled else 0)
 
     def test_configured_preset_name_is_persisted_as_stable_id(self):

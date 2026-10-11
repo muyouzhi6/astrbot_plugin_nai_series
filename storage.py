@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -99,6 +100,22 @@ class Store:
         folder.mkdir(exist_ok=True)
         return folder / (hashlib.sha256(task_id.encode()).hexdigest() + ".png")
 
+    def reference_path(self, reference_id):
+        if not re.fullmatch(r"[a-f0-9]{64}", reference_id):
+            raise ValueError("参考图编号无效")
+        folder = self.root / "references"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        return folder / (reference_id + ".png")
+
+    def save_reference(self, owner, data):
+        reference_id = hashlib.sha256(owner.encode() + b"\0" + data).hexdigest()
+        path = self.reference_path(reference_id)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_bytes(data)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        return reference_id
+
     def prune_jobs(self, cutoff, active):
         for job in self.jobs():
             if job["state"] in active or job.get("updated", job["created"]) >= cutoff:
@@ -111,3 +128,12 @@ class Store:
                     "DELETE FROM state WHERE key=?",
                     ("completion:" + (job.get("batch_id") or job["id"]),),
                 )
+        keep = {j.get("request", {}).get("reference_id") for j in self.jobs()}
+        with self.connect() as db:
+            for (value,) in db.execute("SELECT value FROM state"):
+                state = json.loads(value)
+                if isinstance(state, dict):
+                    keep.add((state.get("last_request") or {}).get("reference_id"))
+        for path in (self.root / "references").glob("*.png"):
+            if path.stem not in keep and path.stat().st_mtime < cutoff:
+                path.unlink()

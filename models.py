@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,6 +65,11 @@ class GenerationRequest:
     noise_schedule: str = "karras"
     cfg_rescale: float = 0.0
     quality: bool = True
+    action: str = "generate"
+    reference_id: str = ""
+    image: str = field(default="", repr=False)
+    strength: float = 0.6
+    noise: float = 0.1
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]{1,120}", self.model):
@@ -74,12 +80,28 @@ class GenerationRequest:
             raise ValueError("宽高必须是 64-2048 范围内的 64 倍数")
         if self.width * self.height > 2097152:
             raise ValueError("图片面积不得超过 2097152 像素")
-        if (
-            not 1 <= self.steps <= 50
-            or not 1 <= self.scale <= 20
-            or not 0 <= self.cfg_rescale <= 20
-        ):
+        if type(self.steps) is not int or not 1 <= self.steps <= 28:
+            raise ValueError("步数必须是 1-28 的整数")
+        if not 1 <= self.scale <= 20 or not 0 <= self.cfg_rescale <= 20:
             raise ValueError("steps/CFG/rescale 参数超出范围")
+        object.__setattr__(self, "sampler", self.sampler.strip())
+        object.__setattr__(self, "noise_schedule", self.noise_schedule.strip())
+        if self.action not in ("generate", "img2img"):
+            raise ValueError("不支持的生成模式")
+        if self.reference_id and not re.fullmatch(r"[a-f0-9]{64}", self.reference_id):
+            raise ValueError("参考图编号无效")
+        if self.action == "img2img" and not (self.reference_id or self.image):
+            raise ValueError("图生图需要参考图")
+        if self.action == "generate" and (self.reference_id or self.image):
+            raise ValueError("文生图不能携带参考图")
+        if any(
+            isinstance(v, bool)
+            or not isinstance(v, (float, int))
+            or not math.isfinite(v)
+            or not 0 <= v <= 1
+            for v in (self.strength, self.noise)
+        ):
+            raise ValueError("strength/noise 必须在 0-1 之间")
 
     @property
     def size(self) -> str:

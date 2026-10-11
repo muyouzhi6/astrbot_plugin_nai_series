@@ -246,7 +246,9 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config.update(
             enable_llm_tool=True, llm_model="nai4", model_nai4="nai-diffusion-4-5-curated"
         )
-        self.assertEqual([t.name for t in make_tools(self.plugin)], ["nai4_generate_image"])
+        self.assertEqual(
+            [t.name for t in make_tools(self.plugin)], ["nai4_generate_image", "nai4_edit_image"]
+        )
         event = Event()
         await self.plugin.generate_as_tool(event, "nai5", {"prompt": "cat", "model": "nai5"})
         await self.finish()
@@ -263,7 +265,9 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         for family in ("nai4", "nai5"):
             self.plugin.config["llm_model"] = family
             tools = make_tools(self.plugin)
-            self.assertEqual([t.name for t in tools], [family + "_generate_image"])
+            self.assertEqual(
+                [t.name for t in tools], [family + "_generate_image", family + "_edit_image"]
+            )
             self.assertNotIn("model", tools[0].parameters["properties"])
             self.assertNotIn("preset", tools[0].parameters["properties"])
         self.plugin.config["llm_model"] = "invalid"

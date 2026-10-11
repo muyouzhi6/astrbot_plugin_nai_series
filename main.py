@@ -1,6 +1,7 @@
 """Nai series commands and silent, durable background image tools."""
 
 import asyncio
+import base64
 import hashlib
 import math
 import re
@@ -29,9 +30,14 @@ from .models import (
     parse_presets,
 )
 from .providers import GenerationError, ProviderRouter
+from .references import collect_images, normalize_image, resolve_image
 from .storage import Store
 from .tools import make_tools
 from .translator import PromptTranslator
+
+NAI_TOOLS = tuple(
+    f"{family}_{mode}_image" for family in ("nai4", "nai5") for mode in ("generate", "edit")
+)
 
 
 class BatchCommandWakeFilter(filter.CustomFilter):
@@ -95,7 +101,7 @@ class NaiSeriesPlugin(Star):
     async def silence_tool_status(self, event: AstrMessageEvent, req):
         if event.get_extra("_nai_completion", False):
             if req.func_tool:
-                for name in ("nai4_generate_image", "nai5_generate_image"):
+                for name in NAI_TOOLS:
                     req.func_tool.remove_tool(name)
             return
         recent = self.store.jobs(self._key(event), limit=4, origin="tool")
@@ -124,7 +130,7 @@ class NaiSeriesPlugin(Star):
         async def guarded_send(message):
             if getattr(message, "type", None) == "tool_call":
                 content = str(getattr(message, "chain", ""))
-                if any(name in content for name in ("nai4_generate_image", "nai5_generate_image")):
+                if any(name in content for name in NAI_TOOLS):
                     return
             if event.get_extra("_nai_silent"):
                 message.chain = [part for part in message.chain if not isinstance(part, Plain)]
@@ -158,7 +164,7 @@ class NaiSeriesPlugin(Star):
             return
         pending = event.get_extra("_nai_preamble", [])
         event.set_extra("_nai_preamble", [])
-        if tool.name in ("nai4_generate_image", "nai5_generate_image"):
+        if tool.name in NAI_TOOLS:
             event.set_extra("_nai_silent", True)
         elif pending:
             await event.get_extra("_nai_original_send")(MessageChain(chain=pending))
@@ -266,19 +272,55 @@ class NaiSeriesPlugin(Star):
             if preset and preset.negative_prompt is not None
             else str(self.config.get(f"negative_prompt_{family}", ""))
         )
+        steps = flags.get("steps", self.config.get(f"steps_{family}", 28))
+        if isinstance(steps, bool) or not re.fullmatch(r"\d+", str(steps)):
+            raise ValueError("步数必须是 1-28 的整数")
+        if any(isinstance(flags.get(key), bool) for key in ("strength", "noise")):
+            raise ValueError("strength/noise 必须在 0-1 之间")
         return GenerationRequest(
             model=model,
             prompt=", ".join(p for p in (artist.strip(), translated.strip()) if p),
             negative_prompt=negative,
             width=width,
             height=height,
-            steps=int(flags.get("steps", self.config.get(f"steps_{family}", 28))),
+            steps=int(steps),
             scale=float(flags.get("scale", self.config.get(f"scale_{family}", 5))),
             sampler=str(self.config.get(f"sampler_{family}", "k_euler_ancestral")),
             noise_schedule=str(self.config.get(f"noise_schedule_{family}", "karras")),
             cfg_rescale=float(self.config.get(f"cfg_rescale_{family}", 0)),
             quality=False,
+            action="img2img" if flags.get("img2img") else "generate",
+            reference_id=flags.get("reference_id", ""),
+            strength=float(flags.get("strength", 0.6)),
+            noise=float(flags.get("noise", 0.1)),
         )
+
+    async def _reference_flags(self, event, model, prompt, flags):
+        self._check_access(event)
+        candidates = None
+        if not flags.get("img2img"):
+            try:
+                async with asyncio.timeout(30):
+                    candidates = await collect_images(event, strict=True, fetch_current=False)
+            except TimeoutError:
+                raise ValueError("参考消息读取超时, 请直接附图") from None
+            if candidates:
+                flags = {**flags, "img2img": True}
+        if not flags.get("img2img"):
+            if any(k in flags for k in ("strength", "noise", "image")):
+                raise ValueError("图生图参数需要参考图, 请附图或引用图片消息")
+            return flags
+        # Validate generation settings before downloading any reference.
+        draft_flags = {**flags, "reference_id": "0" * 64}
+        draft = self._request(
+            model, prompt, self._preset(event, model, flags.get("preset")), draft_flags
+        )
+        try:
+            data = await resolve_image(event, flags.get("image"), candidates=candidates)
+            data = await asyncio.to_thread(normalize_image, data, (draft.width, draft.height))
+        except TimeoutError:
+            raise ValueError("参考图读取超时, 请重新发图") from None
+        return {**flags, "reference_id": self.store.save_reference(self._key(event), data)}
 
     def _check_access(self, event):
         if self.config.get("admin_only", False) and not event.is_admin():
@@ -446,6 +488,14 @@ class NaiSeriesPlugin(Star):
     async def _process_job(self, job, queue):
         try:
             if job["state"] != "generated":
+                reference = None
+                if job["request"].get("action") == "img2img":
+                    try:
+                        reference = await asyncio.to_thread(
+                            self.store.reference_path(job["request"]["reference_id"]).read_bytes
+                        )
+                    except OSError:
+                        raise GenerationError("参考图已失效, 未提交生成") from None
                 queue.transition(job, "translating")
                 prompt = job["original_prompt"]
                 translated = prompt if job["raw"] else await self.translator.translate(prompt)
@@ -467,7 +517,12 @@ class NaiSeriesPlugin(Star):
                 ):
                     await self._send(job["umo"], [Plain(f"翻译: {translated}")])
                 queue.transition(job, "running", request=asdict(request))
-                images, _route = await self.router.generate(request)
+                outbound = (
+                    replace(request, image=base64.b64encode(reference).decode())
+                    if reference
+                    else request
+                )
+                images, _route = await self.router.generate(outbound)
                 if len(images) != 1:
                     raise GenerationError("接口返回图片数量与单张请求不一致")
                 path = self.store.image_path(job["id"])
@@ -495,6 +550,16 @@ class NaiSeriesPlugin(Star):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if isinstance(exc, GenerationError):
+                queue.transition(
+                    job, job["state"], http_status=exc.status, request_id=exc.request_id
+                )
+                logger.warning(
+                    "[NaiSeries] task=%s status=%s request_id=%s",
+                    job["id"],
+                    exc.status,
+                    exc.request_id,
+                )
             logger.warning(
                 "[NaiSeries] task=%s stage=%s error=%s", job["id"], job["state"], type(exc).__name__
             )
@@ -507,10 +572,12 @@ class NaiSeriesPlugin(Star):
                     pass
             raise
 
-    async def _run(self, event, family, text, count_override=None):
+    async def _run(self, event, family, text, count_override=None, img2img=False):
         event.should_call_llm(True)
         try:
             prompt, flags = generation_args(text)
+            if img2img:
+                flags["img2img"] = True
             flagged_count = flags.pop("count", None)
             if count_override is not None and flagged_count is not None:
                 raise ValueError("批量指令已指定数量, 不要再写 --count")
@@ -524,6 +591,7 @@ class NaiSeriesPlugin(Star):
             model = self._model(flags.pop("model", family))
             if family in ("nai4", "nai5") and model_family(model) != family:
                 raise ValueError(f"请使用 /{model_family(model)} 调用另一模型族")
+            flags = await self._reference_flags(event, model, prompt, flags)
             self._submit(
                 event,
                 model,
@@ -562,6 +630,13 @@ class NaiSeriesPlugin(Star):
     @filter.command("nai生图")
     async def cmd_generate(self, event: AstrMessageEvent, prompt: GreedyStr = GreedyStr):
         async for item in self._run(event, self._state(event).model, str(prompt or "")):
+            yield item
+
+    @filter.command("nai图生图")
+    async def cmd_img2img(self, event: AstrMessageEvent, prompt: GreedyStr = GreedyStr):
+        async for item in self._run(
+            event, self._state(event).model, str(prompt or ""), img2img=True
+        ):
             yield item
 
     def _choose(self, event, family, name):
@@ -764,6 +839,8 @@ class NaiSeriesPlugin(Star):
         yield event.plain_result(
             "\n".join(
                 f"{j['id']} | {j['request']['model']} | {LABELS.get(j['state'], j['state'])}"
+                + (f" | HTTP {j['http_status']}" if j.get("http_status") else "")
+                + (f" | 请求编号 {j['request_id']}" if j.get("request_id") else "")
                 for j in jobs
             )
             + (f"\n上次未提交: {rejected}" if rejected else "")
@@ -785,6 +862,10 @@ class NaiSeriesPlugin(Star):
     @filter.command("nai帮助")
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
+            "图生图: 附图或引用图片 + /nai图生图 描述 --model nai5\n"
+            "/nai4、/nai5、/nai生图: 有附图或引用图自动图生图, 无图文生图\n"
+            "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
+            "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"
             "Nai系列生图\n/nai4 描述 或 /nai5 描述\n批量: /3nai4 描述 或 /3nai5 描述\n选项放描述后: --count 3 --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
         )
 
@@ -795,20 +876,49 @@ class NaiSeriesPlugin(Star):
         event.clear_result()
         if not self.config.get("enable_llm_tool", False):
             return None
+        claim = None
         try:
             family = self._llm_family()
             count = self._count(kwargs.get("count", 1))
             prompt = str(kwargs.get("prompt", ""))
             preset = self._llm_preset(family)
-            signature = hashlib.sha256(repr((family, prompt, count, preset)).encode()).hexdigest()
+            editing = kwargs.get("_img2img", False)
+            signature = hashlib.sha256(
+                repr(
+                    (
+                        family,
+                        prompt,
+                        count,
+                        preset,
+                        kwargs.get("strength", 0.6),
+                        kwargs.get("noise", 0.1),
+                        kwargs.get("image_index"),
+                    )
+                ).encode()
+            ).hexdigest()
             submitted = event.get_extra("_nai_submitted", {})
             if signature in submitted:
                 return None
+            # Reserve before any await so parallel calls cannot enqueue twice.
+            submitted[signature] = "preparing"
+            event.set_extra("_nai_submitted", submitted)
+            claim = (submitted, signature)
+            flags = {"preset": preset}
+            if editing:
+                flags.update(img2img=True)
+            for source, target in (
+                ("strength", "strength"),
+                ("noise", "noise"),
+                ("image_index", "image"),
+            ):
+                if source in kwargs:
+                    flags[target] = kwargs[source]
+            flags = await self._reference_flags(event, self._model(family), prompt, flags)
             task_id = self._submit(
                 event,
                 self._model(family),
                 prompt,
-                flags={"preset": preset},
+                flags=flags,
                 silent=True,
                 count=count,
                 completion=await self._completion_target(event),
@@ -829,5 +939,8 @@ class NaiSeriesPlugin(Star):
                     logger.warning("[NaiSeries] rejection notification failed")
         except Exception:
             logger.warning("[NaiSeries] tool submission failed")
+        finally:
+            if claim and claim[0].get(claim[1]) == "preparing":
+                claim[0].pop(claim[1], None)
         # AstrBot treats None as a direct-result tool and ends the agent loop.
         return None

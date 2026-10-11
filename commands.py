@@ -5,7 +5,9 @@ import re
 
 def generation_args(text):
     flags = {}
-    pattern = r"(?:^|\s)--(raw|preset|model|size|steps|scale|count)(?=\s|$)"
+    pattern = (
+        r"(?:^|\s)--(raw|img2img|preset|model|size|steps|scale|count|strength|noise|image)(?=\s|$)"
+    )
     matches = list(re.finditer(pattern, text))
     if not matches:
         return text.strip(), flags
@@ -17,9 +19,9 @@ def generation_args(text):
         key = match.group(1)
         if key in flags:
             raise ValueError(f"重复参数 --{key}")
-        if key == "raw":
+        if key in ("raw", "img2img"):
             if value:
-                raise ValueError("--raw 不接受参数, 请把描述放在选项前")
+                raise ValueError(f"--{key} 不接受参数, 请把描述放在选项前")
             flags[key] = True
         else:
             if not value:

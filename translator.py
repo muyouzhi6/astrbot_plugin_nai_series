@@ -142,7 +142,8 @@ RATING
 
 INFERENCE RULES
 - Infer missing but necessary visual details (hair color, shot type) only when needed for a coherent image. Mark invented details minimally; do not overwrite user specs.
-- Always add camera angles (cowboy shot, from below, full body), lighting (soft lighting, cinematic lighting, sunlight), general style (anime style, illustration, digital art), and quality tags (masterpiece, best quality, very aesthetic, absurdres) to improve output.
+- Always add camera angles, lighting, general style keywords (anime style, illustration, digital art), and quality tags.
+- DO NOT add artist names (wlop, greg rutkowski, artgerm, etc.) — those conflict with the preset.
 - If clothing and nude state conflict, follow the more explicit sexual intent.
 - If user already pasted tags, clean them: underscores→spaces, A1111 weights→NAI weights, dedupe, reorder.
 - Preserve user's important specifics: hair, eyes, outfit pieces, exact act, camera, location.
