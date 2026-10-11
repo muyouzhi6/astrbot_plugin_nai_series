@@ -67,6 +67,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_post("/v1/images/generations", generate)
         app.router.add_post("/v1/chat/completions", generate)
         app.router.add_get("/image.png", image)
+        app.router.add_get("/image(with-parentheses).png", image)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -195,6 +196,20 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(stream=stream, content_type=content_type):
                         self.body = response.encode()
                         await self.assert_image()
+
+    async def test_standard_image_generation_completed_event_uses_top_level_b64_json(self):
+        self.content_type = "text/event-stream"
+        self.body = sse(
+            {"type": "image_generation.completed", "b64_json": B64}
+        ).encode()
+        await self.assert_image()
+
+    async def test_markdown_image_url_with_parentheses_is_downloaded(self):
+        image_url = self.base_url + "/image(with-parentheses).png"
+        self.set_json(chat(f"![cat]({image_url})"))
+        with self.public_ip:
+            images = await self.provider.generate(REQUEST)
+        self.assertEqual([item.data for item in images], [PNG])
 
     async def test_multiple_images_and_content_parts(self):
         self.set_json(

@@ -197,6 +197,43 @@ def chat_content_parts(content: Any) -> tuple[str, list[str]]:
     return "".join(text), urls
 
 
+def markdown_image_values(text: str) -> list[str]:
+    """Extract image destinations while respecting balanced URL parentheses."""
+    values = []
+    marker = re.compile(r"!\[[^\]]*\]\(")
+    for match in marker.finditer(text):
+        position = match.end()
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            continue
+        if text[position] == "<":
+            end = text.find(">", position + 1)
+            if end < 0:
+                continue
+            value = text[position + 1 : end]
+            position = end + 1
+        else:
+            start = position
+            depth = 0
+            while position < len(text):
+                char = text[position]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif char.isspace() and depth == 0:
+                    break
+                position += 1
+            value = text[start:position]
+        if not (value.startswith(("http://", "https://", "data:image/"))):
+            continue
+        values.append(value)
+    return values
+
+
 class OpenAIImagesProvider:
     def __init__(
         self, name: str, base_url: str, api_key: str, timeout: int = 300, use_stream: bool = False
@@ -252,6 +289,11 @@ class OpenAIImagesProvider:
                     value = item.get("b64_json") or item.get("url")
                     if value:
                         values.append(value)
+            if data.get("type") == "image_generation.completed":
+                recognized = True
+                value = data.get("b64_json")
+                if value:
+                    values.append(value)
             # Some relays expose NovelAI final-image events directly.
             if "image" in data:
                 recognized = True
@@ -275,14 +317,10 @@ class OpenAIImagesProvider:
                     values.extend(urls)
         for parts in texts.values():
             text = "".join(parts)
-            # Collect in document order; data URIs inside markdown are decoded once.
-            pattern = (
-                r"!\[[^\]]*\]\(\s*<?((?:https?://|data:image/)[^\s<>]+?)>?"
-                r'(?:\s+"[^"\n]*")?\s*\)'
-                r"|(data:image/[\w.+-]+;base64,[A-Za-z0-9+/=]+)"
-            )
-            for match in re.finditer(pattern, text):
-                values.append(match[1] or match[2])
+            values.extend(markdown_image_values(text))
+            for value in re.findall(r"data:image/[\w.+-]+;base64,[A-Za-z0-9+/=]+", text):
+                if value not in values:
+                    values.append(value)
         if not recognized:
             raise GenerationError("图片接口返回格式无法识别")
         if not values:
