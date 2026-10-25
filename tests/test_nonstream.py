@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import importlib.util
 import json
 import unittest
 from types import SimpleNamespace
@@ -18,9 +17,10 @@ from astrbot_plugin_nai_series.providers import (
     download_image,
     openai_response_objects,
 )
+from test_behavior import NaiSeriesPlugin
 from test_core import PNG
 
-HAS_ASTRBOT = importlib.util.find_spec("astrbot") is not None
+HAS_ASTRBOT = NaiSeriesPlugin is not None
 
 B64 = base64.b64encode(PNG).decode()
 URI = f"data:image/png;base64,{B64}"
