@@ -11,3 +11,18 @@ jobs:
       - run: python -m pip install -r requirements.txt ruff
       - run: ruff check .
       - run: python -m unittest discover -s tests -v
+
+  native-runtime:
+    name: AstrBot ${{ matrix.astrbot-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        astrbot-version: ["4.28.2", "4.29.3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt AstrBot==${{ matrix.astrbot-version }}
+      - run: python -m unittest discover -s tests -v
