@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import importlib.util
 import json
 import unittest
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from astrbot_plugin_nai_series.providers import (
     openai_response_objects,
 )
 from test_core import PNG
+
+HAS_ASTRBOT = importlib.util.find_spec("astrbot") is not None
 
 B64 = base64.b64encode(PNG).decode()
 URI = f"data:image/png;base64,{B64}"
@@ -199,9 +202,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_standard_image_generation_completed_event_uses_top_level_b64_json(self):
         self.content_type = "text/event-stream"
-        self.body = sse(
-            {"type": "image_generation.completed", "b64_json": B64}
-        ).encode()
+        self.body = sse({"type": "image_generation.completed", "b64_json": B64}).encode()
         await self.assert_image()
 
     async def test_markdown_image_url_with_parentheses_is_downloaded(self):
@@ -328,6 +329,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(GenerationError, "格式无法识别"):
                 openai_response_objects(body)
 
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
     async def test_translator_stream_switch_and_content_array(self):
         from astrbot_plugin_nai_series.translator import PromptTranslator
 
@@ -359,6 +361,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             translator.use_stream = stream
             self.assertEqual("POSITIVE: cat, UNDESIRED: bad", await translator.translate("一只猫"))
 
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
     async def test_translator_errors_are_safe_and_distinct(self):
         from astrbot_plugin_nai_series.translator import PromptTranslator
 
@@ -407,6 +410,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("fake-credential", str(context.exception))
 
 
+@unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
 class ErrorDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_background_reason_reaches_notifications_and_task_status(self):
         from test_behavior import Event, PluginTests
